@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.goos }}-${{ matrix.goarch }})
+    name: Build (${{ matrix.label }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -19,65 +19,103 @@ jobs:
           - goos: windows
             goarch: amd64
             suffix: .exe
+            label: windows-amd64
           - goos: linux
             goarch: amd64
             suffix: ""
+            label: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: ""
+            label: android-arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            suffix: ""
+            label: android-arm32
           - goos: darwin
             goarch: amd64
             suffix: ""
+            label: macos-amd64
           - goos: darwin
             goarch: arm64
             suffix: ""
+            label: macos-arm64
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
-      - name: Build
+      - name: Build binaries
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME:-dev}
-          FOLDER="flowdriver-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          FOLDER="flowdriver-${VERSION}-${{ matrix.label }}"
           mkdir -p "$FOLDER"
 
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w" -o "$FOLDER/client${{ matrix.suffix }}" ./cmd/client
+          export CGO_ENABLED=0
+          export GOOS=${{ matrix.goos }}
+          export GOARCH=${{ matrix.goarch }}
+          ${{ matrix.goarm && format('export GOARM={0}', matrix.goarm) || 'true' }}
 
-          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags="-s -w" -o "$FOLDER/server${{ matrix.suffix }}" ./cmd/server
+          go build -ldflags="-s -w" -o "$FOLDER/client${{ matrix.suffix }}" ./cmd/client
+          go build -ldflags="-s -w" -o "$FOLDER/server${{ matrix.suffix }}" ./cmd/server
 
-          cp client_config.json.example "$FOLDER/"
-          cp server_config.json.example "$FOLDER/"
-          cp README.md "$FOLDER/"
+          [ -f client_config.json.example ] && cp client_config.json.example "$FOLDER/"
+          [ -f server_config.json.example ] && cp server_config.json.example "$FOLDER/"
+          [ -f README.md ] && cp README.md "$FOLDER/"
+
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            printf '@echo off\ntitle FlowDriver\necho Connecting...\n.\\client.exe -c client_config.json -gc credentials.json\npause\n' > "$FOLDER/RunTunnel.bat"
+          fi
+
+          if [[ "${{ matrix.label }}" == android-* ]]; then
+            cat > "$FOLDER/HOW-TO-ANDROID.txt" << 'TXT'
+=== اجرا در اندروید بدون Root ===
+
+روش ۱ — UserLand (پیشنهادی، بدون root):
+1. UserLand را از Play Store نصب کنید
+2. یک محیط Alpine Linux بسازید
+3. فایل client را آپلود کنید و اجرا کنید:
+   chmod +x ./client
+   ./client -c client_config.json -gc credentials.json
+4. در SocksDroid آدرس 127.0.0.1:1080 را وارد کنید
+
+روش ۲ — Termux (از F-Droid، نه Play Store):
+1. Termux را نصب کنید
+2. pkg install -y wget
+3. wget <لینک فایل client از GitHub Releases>
+4. chmod +x ./client
+5. ./client -c client_config.json -gc credentials.json
+
+اپ‌های proxy برای اندروید:
+- SocksDroid: همه ترافیک رو از SOCKS5 رد می‌کنه
+- ProxyDroid: نیاز به root دارد
+TXT
+          fi
 
           zip -r "${FOLDER}.zip" "$FOLDER/"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          name: ${{ matrix.label }}
           path: "*.zip"
 
   release:
-    name: Create Release
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.zip
           generate_release_notes: true
