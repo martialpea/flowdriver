@@ -1,4 +1,49 @@
-- name: Build binaries
+name: Build & Release
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            suffix: .exe
+            label: windows-amd64
+          - goos: linux
+            goarch: amd64
+            suffix: ""
+            label: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: ""
+            label: android-arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            suffix: ""
+            label: android-arm32
+          - goos: darwin
+            goarch: amd64
+            suffix: ""
+            label: macos-amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: ""
+            label: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build binaries
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME:-dev}
@@ -46,3 +91,25 @@
           fi
           
           zip -r "${FOLDER}.zip" "$FOLDER/"
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: "*.zip"
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
