@@ -13,8 +13,6 @@ import (
 	"github.com/NullLatency/flow-driver/internal/storage"
 )
 
-// Engine manages the local sessions, periodically flushes Tx buffers to files,
-// and polls for new Rx files.
 type Engine struct {
 	backend storage.Backend
 	myDir   Direction
@@ -32,9 +30,7 @@ type Engine struct {
 
 	OnNewSession func(sessionID, targetAddr string, s *Session)
 
-	sem chan struct{}
-
-	// بهینه‌سازی: struct{} به جای bool برای کاهش ۸ برابری مصرف رم
+	sem         chan struct{}
 	processed   map[string]struct{}
 	processedMu sync.Mutex
 }
@@ -48,6 +44,7 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		processed:      make(map[string]struct{}),
 		pollTicker:     500 * time.Millisecond,
 		flushTicker:    300 * time.Millisecond,
+		sem:            make(chan struct{}, 8),
 	}
 	if isClient {
 		e.myDir = DirReq
@@ -56,17 +53,7 @@ func NewEngine(backend storage.Backend, isClient bool, clientID string) *Engine 
 		e.myDir = DirRes
 		e.peerDir = DirReq
 	}
-	e.sem = make(chan struct{}, 8)
 	return e
-}
-
-func (e *Engine) SetRefreshRate(ms int) {
-	if ms > 0 {
-		e.pollTicker = time.Duration(ms) * time.Millisecond
-		if e.flushTicker == 300*time.Millisecond {
-			e.flushTicker = time.Duration(ms) * time.Millisecond
-		}
-	}
 }
 
 func (e *Engine) SetPollRate(ms int) {
@@ -97,8 +84,20 @@ func (e *Engine) AddSession(s *Session) {
 	e.sessionMu.Lock()
 	defer e.sessionMu.Unlock()
 	e.sessions[s.ID] = s
-	log.Printf("Engine.AddSession: Added session %s (Total now: %d)", s.ID, len(e.sessions))
+	log.Printf("[session] added %s (total: %d)", s.ID, len(e.sessions))
 }
+
+func (e *Engine) RemoveSession(id string) {
+	e.sessionMu.Lock()
+	delete(e.sessions, id)
+	e.sessionMu.Unlock()
+
+	e.closedSessionsMu.Lock()
+	e.closedSessions[id] = time.Now()
+	e.closedSessionsMu.Unlock()
+}
+
+// ── flush loop ────────────────────────────────────────────────────────────────
 
 func (e *Engine) flushLoop(ctx context.Context) {
 	ticker := time.NewTicker(e.flushTicker)
@@ -122,11 +121,12 @@ func (e *Engine) flushAll(ctx context.Context) {
 	e.sessionMu.Unlock()
 
 	muxes := make(map[string][]Envelope)
-	var closedSessionIDs []string
+	var closedIDs []string
 
 	for _, s := range sessions {
 		s.mu.Lock()
 
+		// idle timeout
 		if time.Since(s.lastActivity) > 10*time.Second {
 			s.closed = true
 		}
@@ -141,33 +141,31 @@ func (e *Engine) flushAll(ctx context.Context) {
 		s.txBuf = nil
 		s.txCond.Broadcast()
 
-		env := Envelope{
+		cid := s.ClientID
+		if cid == "" && e.myDir == DirReq {
+			cid = e.id
+		}
+
+		muxes[cid] = append(muxes[cid], Envelope{
 			SessionID:  s.ID,
 			Seq:        s.txSeq,
 			Payload:    payload,
 			Close:      s.closed,
 			TargetAddr: s.TargetAddr,
-		}
+		})
 		s.txSeq++
 
 		if s.closed {
-			closedSessionIDs = append(closedSessionIDs, s.ID)
+			closedIDs = append(closedIDs, s.ID)
 		}
-
-		cid := s.ClientID
-		if cid == "" && e.myDir == DirReq {
-			cid = e.id
-		}
-		muxes[cid] = append(muxes[cid], env)
 		s.mu.Unlock()
 	}
 
 	for cid, mux := range muxes {
-		fnameCID := cid
-		if fnameCID == "" {
-			fnameCID = "unknown"
+		if cid == "" {
+			cid = "unknown"
 		}
-		filename := fmt.Sprintf("%s-%s-mux-%d.bin", e.myDir, fnameCID, time.Now().UnixNano())
+		fname := fmt.Sprintf("%s-%s-mux-%d.bin", e.myDir, cid, time.Now().UnixNano())
 
 		go func(fname string, m []Envelope) {
 			e.sem <- struct{}{}
@@ -178,50 +176,48 @@ func (e *Engine) flushAll(ctx context.Context) {
 				defer pw.Close()
 				for _, env := range m {
 					if err := env.Encode(pw); err != nil {
-						log.Printf("mux encode error: %v", err)
+						log.Printf("[encode] %v", err)
 						break
 					}
 				}
 			}()
 
-			// بهینه‌سازی: Retry با exponential backoff — جلوگیری از crash هنگام 429/503
 			if err := uploadWithRetry(ctx, e.backend, fname, pr); err != nil {
-				log.Printf("upload error %s (after retries): %v", fname, err)
+				log.Printf("[upload] %s failed: %v", fname, err)
 			}
-		}(filename, mux)
+		}(fname, mux)
 	}
 
-	for _, id := range closedSessionIDs {
+	for _, id := range closedIDs {
 		e.RemoveSession(id)
 	}
 }
 
-// uploadWithRetry: تلاش مجدد با exponential backoff برای خطاهای موقتی Drive
 func uploadWithRetry(ctx context.Context, backend storage.Backend, fname string, r io.Reader) error {
-	maxAttempts := 4
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err := backend.Upload(ctx, fname, r)
-		if err == nil {
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := backend.Upload(ctx, fname, r); err == nil {
 			return nil
-		}
-		if attempt == maxAttempts-1 {
+		} else if attempt == 3 {
 			return err
-		}
-		wait := time.Duration(1<<uint(attempt)) * time.Second // 1s, 2s, 4s
-		log.Printf("upload attempt %d failed for %s: %v — retrying in %s", attempt+1, fname, err, wait)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
+		} else {
+			wait := time.Duration(1<<uint(attempt)) * time.Second
+			log.Printf("[upload] attempt %d failed, retry in %s", attempt+1, wait)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
+			}
 		}
 	}
 	return nil
 }
 
+// ── poll loop ─────────────────────────────────────────────────────────────────
+
 func (e *Engine) pollLoop(ctx context.Context) {
-	currentPollInterval := e.pollTicker
-	maxPollInterval := 5 * time.Second
-	timer := time.NewTimer(currentPollInterval)
+	currentInterval := e.pollTicker
+	const maxInterval = 5 * time.Second
+	timer := time.NewTimer(currentInterval)
 	defer timer.Stop()
 
 	for {
@@ -230,12 +226,13 @@ func (e *Engine) pollLoop(ctx context.Context) {
 			return
 		case <-timer.C:
 		pollAgain:
+			// کلاینت: اگه session نداریم poll نکن — صرفه‌جویی در quota
 			if e.myDir == DirReq {
 				e.sessionMu.RLock()
 				count := len(e.sessions)
 				e.sessionMu.RUnlock()
 				if count == 0 {
-					timer.Reset(currentPollInterval)
+					timer.Reset(currentInterval)
 					continue
 				}
 			}
@@ -245,45 +242,39 @@ func (e *Engine) pollLoop(ctx context.Context) {
 				prefix += e.id + "-mux-"
 			}
 
-			// بهینه‌سازی: Retry برای list هم اضافه شد
 			files, err := listWithRetry(ctx, e.backend, prefix)
 			if err != nil {
-				log.Printf("poll list error: %v", err)
-				timer.Reset(currentPollInterval)
+				log.Printf("[poll] list error: %v", err)
+				timer.Reset(currentInterval)
 				continue
 			}
 
 			if len(files) == 0 {
+				// سرور: وقتی idle است poll رو کند کن
 				if e.myDir == DirRes {
 					e.sessionMu.RLock()
-					activeSessions := len(e.sessions)
+					active := len(e.sessions)
 					e.sessionMu.RUnlock()
-
-					if activeSessions == 0 {
-						currentPollInterval += 500 * time.Millisecond
-						if currentPollInterval > maxPollInterval {
-							currentPollInterval = maxPollInterval
+					if active == 0 {
+						currentInterval += 500 * time.Millisecond
+						if currentInterval > maxInterval {
+							currentInterval = maxInterval
 						}
 					} else {
-						currentPollInterval = e.pollTicker
+						currentInterval = e.pollTicker
 					}
 				}
-				timer.Reset(currentPollInterval)
+				timer.Reset(currentInterval)
 				continue
 			}
-
-			currentPollInterval = e.pollTicker
+			currentInterval = e.pollTicker
 
 			var wg sync.WaitGroup
 			for _, f := range files {
-				parts := strings.Split(f, "-")
-				if len(parts) >= 3 {
-					tsStr := strings.TrimSuffix(parts[len(parts)-1], ".bin")
-					ts, _ := strconv.ParseInt(tsStr, 10, 64)
-					if ts > 0 && time.Since(time.Unix(0, ts)) > 5*time.Minute {
-						e.backend.Delete(ctx, f)
-						continue
-					}
+				// فایل‌های قدیمی‌تر از ۵ دقیقه رو حذف کن
+				if ts := extractTimestamp(f); ts > 0 && time.Since(time.Unix(0, ts)) > 5*time.Minute {
+					e.backend.Delete(ctx, f)
+					continue
 				}
 
 				e.processedMu.Lock()
@@ -292,7 +283,6 @@ func (e *Engine) pollLoop(ctx context.Context) {
 					e.processed[f] = struct{}{}
 				}
 				e.processedMu.Unlock()
-
 				if already {
 					continue
 				}
@@ -300,13 +290,12 @@ func (e *Engine) pollLoop(ctx context.Context) {
 				wg.Add(1)
 				go func(fname string) {
 					defer wg.Done()
-
 					e.sem <- struct{}{}
 					defer func() { <-e.sem }()
 
 					rc, err := e.backend.Download(ctx, fname)
 					if err != nil {
-						log.Printf("download error %s: %v", fname, err)
+						log.Printf("[download] %s: %v", fname, err)
 						e.processedMu.Lock()
 						delete(e.processed, fname)
 						e.processedMu.Unlock()
@@ -314,99 +303,85 @@ func (e *Engine) pollLoop(ctx context.Context) {
 					}
 					defer rc.Close()
 
-					var fileClientID string
-					parts := strings.Split(fname, "-")
-					if len(parts) >= 4 && parts[2] == "mux" {
-						fileClientID = parts[1]
-					}
-
-					for {
-						var env Envelope
-						if err := env.Decode(rc); err != nil {
-							if err != io.EOF && err != io.ErrUnexpectedEOF {
-								log.Printf("mux decode error %s: %v", fname, err)
-							}
-							break
-						}
-
-						e.closedSessionsMu.Lock()
-						_, isClosed := e.closedSessions[env.SessionID]
-						e.closedSessionsMu.Unlock()
-						if isClosed {
-							continue
-						}
-
-						e.sessionMu.Lock()
-						s, exists := e.sessions[env.SessionID]
-						if !exists && e.myDir == DirRes && e.OnNewSession != nil {
-							s = NewSession(env.SessionID)
-							s.ClientID = fileClientID
-							e.sessions[env.SessionID] = s
-							e.sessionMu.Unlock()
-							log.Printf("Engine: Triggering new session %s for Client %s", env.SessionID, fileClientID)
-							e.OnNewSession(env.SessionID, env.TargetAddr, s)
-						} else {
-							e.sessionMu.Unlock()
-						}
-
-						if s != nil {
-							s.ProcessRx(&env)
-						}
-					}
-
+					clientID := extractClientID(fname)
+					e.processMuxFile(ctx, fname, clientID, rc)
 					e.backend.Delete(ctx, fname)
 				}(f)
 			}
-
 			wg.Wait()
-			time.Sleep(100 * time.Millisecond)
+
+			// اگه هنوز فایل هست فوری دوباره poll کن
+			time.Sleep(50 * time.Millisecond)
 			goto pollAgain
 		}
 	}
 }
 
-// listWithRetry: تلاش مجدد برای list با backoff
+func (e *Engine) processMuxFile(ctx context.Context, fname, clientID string, rc io.Reader) {
+	for {
+		var env Envelope
+		if err := env.Decode(rc); err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				log.Printf("[decode] %s: %v", fname, err)
+			}
+			return
+		}
+
+		e.closedSessionsMu.Lock()
+		_, isClosed := e.closedSessions[env.SessionID]
+		e.closedSessionsMu.Unlock()
+		if isClosed {
+			continue
+		}
+
+		e.sessionMu.Lock()
+		s, exists := e.sessions[env.SessionID]
+		if !exists && e.myDir == DirRes && e.OnNewSession != nil {
+			s = NewSession(env.SessionID)
+			s.ClientID = clientID
+			e.sessions[env.SessionID] = s
+			e.sessionMu.Unlock()
+			log.Printf("[session] new %s from client %s -> %s", env.SessionID, clientID, env.TargetAddr)
+			e.OnNewSession(env.SessionID, env.TargetAddr, s)
+		} else {
+			e.sessionMu.Unlock()
+		}
+
+		if s != nil {
+			s.ProcessRx(&env)
+		}
+	}
+}
+
 func listWithRetry(ctx context.Context, backend storage.Backend, prefix string) ([]string, error) {
-	maxAttempts := 3
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		files, err := backend.ListQuery(ctx, prefix)
-		if err == nil {
+	for attempt := 0; attempt < 3; attempt++ {
+		if files, err := backend.ListQuery(ctx, prefix); err == nil {
 			return files, nil
-		}
-		lastErr = err
-		if attempt == maxAttempts-1 {
-			break
-		}
-		wait := time.Duration(1<<uint(attempt)) * 500 * time.Millisecond
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(wait):
+		} else {
+			lastErr = err
+			wait := time.Duration(1<<uint(attempt)) * 500 * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
 		}
 	}
 	return nil, lastErr
 }
 
-func (e *Engine) RemoveSession(id string) {
-	e.sessionMu.Lock()
-	delete(e.sessions, id)
-	e.sessionMu.Unlock()
-
-	e.closedSessionsMu.Lock()
-	e.closedSessions[id] = time.Now()
-	e.closedSessionsMu.Unlock()
-}
+// ── cleanup loop ──────────────────────────────────────────────────────────────
 
 func (e *Engine) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// tombstone های قدیمی رو پاک کن
 			e.closedSessionsMu.Lock()
 			for id, t := range e.closedSessions {
 				if time.Since(t) > 30*time.Second {
@@ -415,13 +390,14 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 			}
 			e.closedSessionsMu.Unlock()
 
-			// بهینه‌سازی: حد پایین‌تر برای processed map و استفاده از struct{}
+			// processed map رو محدود کن
 			e.processedMu.Lock()
 			if len(e.processed) > 3000 {
 				e.processed = make(map[string]struct{})
 			}
 			e.processedMu.Unlock()
 
+			// کلاینت: اگه session نداریم Drive رو scan نکن
 			if e.myDir == DirReq {
 				e.sessionMu.RLock()
 				count := len(e.sessions)
@@ -431,19 +407,36 @@ func (e *Engine) cleanupLoop(ctx context.Context) {
 				}
 			}
 
+			// فایل‌های قدیمی خودم رو پاک کن
 			files, _ := e.backend.ListQuery(ctx, string(e.myDir)+"-")
 			for _, f := range files {
-				parts := strings.Split(f, "-")
-				if len(parts) >= 3 {
-					tsStr := parts[len(parts)-1]
-					tsStr = strings.TrimSuffix(tsStr, ".json")
-					tsStr = strings.TrimSuffix(tsStr, ".bin")
-					ts, err := strconv.ParseInt(tsStr, 10, 64)
-					if err == nil && time.Since(time.Unix(0, ts)) > 10*time.Second {
-						e.backend.Delete(ctx, f)
-					}
+				if ts := extractTimestamp(f); ts > 0 && time.Since(time.Unix(0, ts)) > 10*time.Second {
+					e.backend.Delete(ctx, f)
 				}
 			}
 		}
 	}
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+func extractTimestamp(fname string) int64 {
+	parts := strings.Split(fname, "-")
+	if len(parts) == 0 {
+		return 0
+	}
+	s := parts[len(parts)-1]
+	s = strings.TrimSuffix(s, ".bin")
+	s = strings.TrimSuffix(s, ".json")
+	ts, _ := strconv.ParseInt(s, 10, 64)
+	return ts
+}
+
+func extractClientID(fname string) string {
+	// فرمت: {dir}-{clientID}-mux-{ts}.bin
+	parts := strings.Split(fname, "-")
+	if len(parts) >= 4 && parts[2] == "mux" {
+		return parts[1]
+	}
+	return ""
 }

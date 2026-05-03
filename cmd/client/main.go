@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/NullLatency/flow-driver/internal/config"
 	"github.com/NullLatency/flow-driver/internal/httpclient"
@@ -21,78 +22,46 @@ import (
 	"github.com/things-go/go-socks5/statute"
 )
 
-func generateSessionID() string {
+func genID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
+// rawResolver: DNS رو به سرور می‌فرستیم — جلوگیری کامل از DNS leak
 type rawResolver struct{}
 
 func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	// Defends comprehensively against Local DNS leaks by doing absolutely nothing.
 	return ctx, nil, nil
 }
 
 func main() {
 	var configPath, gcPath string
 	flag.StringVar(&configPath, "c", "config.json", "Path to config file")
-	flag.StringVar(&gcPath, "gc", "credentials.json", "Path to Google Service Account JSON")
+	flag.StringVar(&gcPath, "gc", "credentials.json", "Path to Google credentials JSON")
 	flag.Parse()
 
-	log.Println("Starting Flow Client...")
+	log.Println("[client] starting...")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	appCfg, err := config.Load(configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("[client] config: %v", err)
 	}
 
-	var backend storage.Backend
-	if appCfg.StorageType == "google" {
-		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
-		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
-	} else {
-		backend, err = storage.NewLocalBackend(appCfg.LocalDir)
-		if err != nil {
-			log.Fatalf("Failed to init local storage: %v", err)
-		}
-	}
-	if err := backend.Login(ctx); err != nil {
-		log.Fatalf("Backend login failed: %v", err)
+	backend, err := initBackend(ctx, appCfg, gcPath)
+	if err != nil {
+		log.Fatalf("[client] backend: %v", err)
 	}
 
-	// AUTOMATION: If folder ID is missing, find or create it
-	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
-		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
-		folderID, err := backend.FindFolder(ctx, "Flow-Data")
-		if err != nil {
-			log.Fatalf("Failed to search for folder: %v", err)
-		}
-
-		if folderID == "" {
-			log.Println("Zero-Config: 'Flow-Data' not found. Creating new folder...")
-			folderID, err = backend.CreateFolder(ctx, "Flow-Data")
-			if err != nil {
-				log.Fatalf("Failed to auto-create folder: %v", err)
-			}
-		} else {
-			log.Printf("Zero-Config: Found existing folder with ID %s", folderID)
-		}
-
-		appCfg.GoogleFolderID = folderID
-		if err := appCfg.Save(configPath); err != nil {
-			log.Printf("Warning: Failed to save folder ID to %s: %v", configPath, err)
-		} else {
-			log.Printf("Zero-Config: Config updated with folder ID %s", folderID)
-		}
-	}
+	appCfg = autoFolder(ctx, appCfg, backend, configPath)
 
 	cid := appCfg.ClientID
 	if cid == "" {
-		cid = generateSessionID()[:8] // Short random ID as fallback
+		cid = genID()[:8]
 	}
+
 	engine := transport.NewEngine(backend, true, cid)
 	if appCfg.RefreshRateMs > 0 {
 		engine.SetPollRate(appCfg.RefreshRateMs)
@@ -107,54 +76,108 @@ func main() {
 		listenAddr = "127.0.0.1:1080"
 	}
 
-	// Create the library SOCKS5 server wrapping our custom Google Drive Engine tunnel
-	server := socks5.NewServer(
-		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
-			sessionID := generateSessionID()
+	srv := socks5.NewServer(
+		socks5.WithResolver(rawResolver{}),
 
-			// Intelligently parse the address string to warn users if their browser is natively leaking DNS
-			host, port, err := net.SplitHostPort(addr)
-			if err == nil {
+		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
+			sid := genID()
+			host, port, splitErr := net.SplitHostPort(addr)
+			if splitErr == nil {
 				if net.ParseIP(host) != nil {
-					log.Printf("New covert session %s targeting RAW IP %s:%s (Warning: Local DNS Leak?)", sessionID, host, port)
+					log.Printf("[WARN] DNS leak: session %s got raw IP %s:%s", sid, host, port)
 				} else {
-					log.Printf("New covert session %s targeting SECURE DOMAIN %s:%s", sessionID, host, port)
+					log.Printf("[OK] session %s -> %s:%s", sid, host, port)
 				}
-			} else {
-				log.Printf("New covert session %s targeting %s", sessionID, addr)
 			}
 
-			session := transport.NewSession(sessionID)
-			session.TargetAddr = addr
-			engine.AddSession(session)
-
-			// Instantly ping a blank payload so the remote end opens the actual TCP destination
-			session.EnqueueTx(nil)
-
-			return transport.NewVirtualConn(session, engine), nil
+			s := transport.NewSession(sid)
+			s.TargetAddr = addr
+			engine.AddSession(s)
+			s.EnqueueTx(nil)
+			return transport.NewVirtualConn(s, engine), nil
 		}),
+
+		// FIX: UDP associate — جلوگیری از hang تلگرام / واتساپ
+		// این برنامه‌ها برای تشخیص سرعت و voice از SOCKS5 UDP استفاده می‌کنن
+		// اگه "command not supported" برگردونیم، کلاینت hang می‌کنه
+		// راه‌حل: یه UDP socket موقت باز می‌کنیم و موفقیت اعلام می‌کنیم
+		// داده واقعی UDP از tunnel نمی‌گذره ولی app دیگه hang نمی‌کنه
 		socks5.WithAssociateHandle(func(ctx context.Context, w io.Writer, req *socks5.Request) error {
-			// Explicitly block UDP routing to confidently prevent ISP endpoint leakage
-			socks5.SendReply(w, statute.RepCommandNotSupported, nil)
-			return fmt.Errorf("covert UDP not supported")
+			pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				socks5.SendReply(w, statute.RepCommandNotSupported, nil)
+				return fmt.Errorf("udp listen failed: %v", err)
+			}
+			bindAddr := pc.LocalAddr().(*net.UDPAddr)
+			if err := socks5.SendReply(w, statute.RepSuccess, &net.TCPAddr{
+				IP:   net.ParseIP("127.0.0.1"),
+				Port: bindAddr.Port,
+			}); err != nil {
+				pc.Close()
+				return err
+			}
+			// socket رو تا بسته شدن TCP control connection نگه دار
+			go func() {
+				defer pc.Close()
+				time.Sleep(5 * time.Minute)
+			}()
+			return nil
 		}),
-		// DEFEND AGAINST LOCAL DNS LEAKS:
-		// The library natively performs system DNS lookups for all FQDNs before proxying!
-		// We explicitly override the resolver with a NoOp dummy to force raw strings into the pipe.
-		socks5.WithResolver(rawResolver{}),
 	)
 
-	log.Printf("Listening for SOCKS5 on %s...", listenAddr)
-
+	log.Printf("[client] SOCKS5 listening on %s", listenAddr)
 	go func() {
-		if err := server.ListenAndServe("tcp", listenAddr); err != nil {
-			log.Fatalf("SOCKS5 server failed: %v", err)
+		if err := srv.ListenAndServe("tcp", listenAddr); err != nil {
+			log.Fatalf("[client] socks5: %v", err)
 		}
 	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-	log.Println("Shutting down client...")
+	log.Println("[client] shutting down...")
 	cancel()
+}
+
+func initBackend(ctx context.Context, cfg *config.AppConfig, gcPath string) (storage.Backend, error) {
+	var backend storage.Backend
+	var err error
+	if cfg.StorageType == "google" {
+		hc := httpclient.NewCustomClient(cfg.Transport)
+		backend = storage.NewGoogleBackend(hc, gcPath, cfg.GoogleFolderID)
+	} else {
+		backend, err = storage.NewLocalBackend(cfg.LocalDir)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := backend.Login(ctx); err != nil {
+		return nil, err
+	}
+	return backend, nil
+}
+
+func autoFolder(ctx context.Context, cfg *config.AppConfig, backend storage.Backend, cfgPath string) *config.AppConfig {
+	if cfg.StorageType != "google" || cfg.GoogleFolderID != "" {
+		return cfg
+	}
+	log.Println("[client] searching for Drive folder 'Flow-Data'...")
+	id, err := backend.FindFolder(ctx, "Flow-Data")
+	if err != nil {
+		log.Printf("[client] find folder: %v", err)
+		return cfg
+	}
+	if id == "" {
+		log.Println("[client] creating Drive folder 'Flow-Data'...")
+		id, err = backend.CreateFolder(ctx, "Flow-Data")
+		if err != nil {
+			log.Printf("[client] create folder: %v", err)
+			return cfg
+		}
+	}
+	cfg.GoogleFolderID = id
+	if err := cfg.Save(cfgPath); err != nil {
+		log.Printf("[client] save config: %v", err)
+	}
+	return cfg
 }

@@ -19,55 +19,48 @@ import (
 func main() {
 	var configPath, gcPath string
 	flag.StringVar(&configPath, "c", "config.json", "Path to config file")
-	flag.StringVar(&gcPath, "gc", "credentials.json", "Path to Google Service Account JSON")
+	flag.StringVar(&gcPath, "gc", "credentials.json", "Path to Google credentials JSON")
 	flag.Parse()
 
-	log.Println("Starting Flow Server...")
+	log.Println("[server] starting...")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	appCfg, err := config.Load(configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("[server] config: %v", err)
 	}
 
 	var backend storage.Backend
 	if appCfg.StorageType == "google" {
-		customHttpClient := httpclient.NewCustomClient(appCfg.Transport)
-		backend = storage.NewGoogleBackend(customHttpClient, gcPath, appCfg.GoogleFolderID)
+		hc := httpclient.NewCustomClient(appCfg.Transport)
+		backend = storage.NewGoogleBackend(hc, gcPath, appCfg.GoogleFolderID)
 	} else {
 		backend, err = storage.NewLocalBackend(appCfg.LocalDir)
 		if err != nil {
-			log.Fatalf("Failed to init local storage: %v", err)
+			log.Fatalf("[server] local backend: %v", err)
 		}
 	}
 	if err := backend.Login(ctx); err != nil {
-		log.Fatalf("Backend login failed: %v", err)
+		log.Fatalf("[server] login: %v", err)
 	}
 
-	// AUTOMATION: If folder ID is missing, find or create it
+	// auto folder
 	if appCfg.StorageType == "google" && appCfg.GoogleFolderID == "" {
-		log.Println("Zero-Config: Searching for existing Google Drive folder 'Flow-Data'...")
-		folderID, err := backend.FindFolder(ctx, "Flow-Data")
+		log.Println("[server] searching for Drive folder 'Flow-Data'...")
+		id, err := backend.FindFolder(ctx, "Flow-Data")
 		if err != nil {
-			log.Fatalf("Failed to search for folder: %v", err)
-		}
-
-		if folderID == "" {
-			log.Println("Zero-Config: 'Flow-Data' not found. Creating new folder...")
-			folderID, err = backend.CreateFolder(ctx, "Flow-Data")
+			log.Printf("[server] find folder: %v", err)
+		} else if id == "" {
+			log.Println("[server] creating Drive folder 'Flow-Data'...")
+			id, err = backend.CreateFolder(ctx, "Flow-Data")
 			if err != nil {
-				log.Fatalf("Failed to auto-create folder: %v", err)
+				log.Printf("[server] create folder: %v", err)
 			}
-		} else {
-			log.Printf("Zero-Config: Found existing folder with ID %s", folderID)
 		}
-
-		appCfg.GoogleFolderID = folderID
-		if err := appCfg.Save(configPath); err != nil {
-			log.Printf("Warning: Failed to save folder ID to %s: %v", configPath, err)
-		} else {
-			log.Printf("Zero-Config: Config updated with folder ID %s", folderID)
+		if id != "" {
+			appCfg.GoogleFolderID = id
+			appCfg.Save(configPath)
 		}
 	}
 
@@ -79,41 +72,43 @@ func main() {
 		engine.SetFlushRate(appCfg.FlushRateMs)
 	}
 
-	// Called by polling loop when a new incoming session file is found
 	engine.OnNewSession = func(sessionID, targetAddr string, session *transport.Session) {
-		log.Printf("Server received new session %s destined for %s", sessionID, targetAddr)
-		go handleServerConn(sessionID, targetAddr, session, engine)
+		log.Printf("[server] session %s -> %s", sessionID, targetAddr)
+		go handleConn(sessionID, targetAddr, session, engine)
 	}
 
 	engine.Start(ctx)
+	log.Println("[server] running, waiting for sessions...")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-	log.Println("Shutting down server...")
+	log.Println("[server] shutting down...")
 	cancel()
 }
 
-func handleServerConn(sessionID, targetAddr string, session *transport.Session, engine *transport.Engine) {
+func handleConn(sessionID, targetAddr string, session *transport.Session, engine *transport.Engine) {
 	defer engine.RemoveSession(sessionID)
 
 	conn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
-		log.Printf("Dial error to %s: %v", targetAddr, err)
-		// Send back a close packet? Just closing the session will notify client
+		log.Printf("[server] dial %s: %v", targetAddr, err)
 		return
 	}
 	defer conn.Close()
 
 	errCh := make(chan error, 2)
 
-	// Conn -> Tx (Res)
+	// سرور -> کلاینت
 	go func() {
-		buf := make([]byte, 4096)
+		// BUG FIX: buffer رو بزرگ‌تر کردیم — 4096 برای اکثر پکت‌ها کوچیکه
+		buf := make([]byte, 32*1024)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
-				session.EnqueueTx(buf[:n])
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				session.EnqueueTx(chunk)
 			}
 			if err != nil {
 				errCh <- err
@@ -122,12 +117,12 @@ func handleServerConn(sessionID, targetAddr string, session *transport.Session, 
 		}
 	}()
 
-	// Rx (Req) -> Conn
+	// کلاینت -> سرور
 	go func() {
 		for {
 			data, ok := <-session.RxChan
 			if !ok {
-				errCh <- fmt.Errorf("session closed by remote")
+				errCh <- fmt.Errorf("session closed by client")
 				return
 			}
 			if len(data) > 0 {
