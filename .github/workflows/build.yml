@@ -1,0 +1,132 @@
+name: Build APK + Go Binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ── مرحله ۱: کامپایل Go binary برای همه پلتفرم‌ها ──────────────────────────
+  build-go:
+    name: Build Go binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: arm64
+            name: client_arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            name: client_arm32
+          - goos: linux
+            goarch: amd64
+            name: client_x86_64
+          - goos: windows
+            goarch: amd64
+            name: client_windows.exe
+          - goos: linux
+            goarch: amd64
+            name: server_linux
+            server: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: flowdriver-src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build
+        working-directory: flowdriver-src
+        run: |
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            ${{ matrix.goarm && format('GOARM={0}', matrix.goarm) || '' }} \
+            go build -ldflags="-s -w" \
+            -o ${{ matrix.name }} \
+            ${{ matrix.server && './cmd/server' || './cmd/client' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-${{ matrix.name }}
+          path: flowdriver-src/${{ matrix.name }}
+
+  # ── مرحله ۲: Build APK اندروید ──────────────────────────────────────────────
+  build-apk:
+    name: Build Android APK
+    needs: build-go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: android-src
+
+      # دانلود همه Go binary ها
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: go-client_*
+          path: binaries
+          merge-multiple: true
+
+      # کپی binary ها به assets
+      - name: Copy binaries to assets
+        run: |
+          mkdir -p android-src/app/src/main/assets
+          cp binaries/client_arm64   android-src/app/src/main/assets/client_arm64   || true
+          cp binaries/client_arm32   android-src/app/src/main/assets/client_arm32   || true
+          cp binaries/client_x86_64  android-src/app/src/main/assets/client_x86_64  || true
+          chmod +x android-src/app/src/main/assets/* || true
+          ls -lh android-src/app/src/main/assets/
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build debug APK
+        working-directory: android-src
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+          cp android-src/app/build/outputs/apk/debug/app-debug.apk \
+             FlowDriver-${VERSION}.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlowDriver-APK
+          path: FlowDriver-*.apk
+
+  # ── مرحله ۳: Release ────────────────────────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [build-go, build-apk]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/FlowDriver-*.apk
+            artifacts/client_*
+            artifacts/server_*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
