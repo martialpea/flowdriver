@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  # ── مرحله ۱: Build Go binaries ────────────────────────────────────────────
+  # ── مرحله ۱: Build Go binaries ──────────────────────────────────────────────
   build-go:
     name: Go (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -19,20 +19,25 @@ jobs:
           - goos: linux
             goarch: arm64
             name: client_arm64
+            cmd: ./cmd/client
           - goos: linux
             goarch: arm
             goarm: "7"
             name: client_arm32
+            cmd: ./cmd/client
           - goos: linux
             goarch: amd64
             name: client_x86_64
+            cmd: ./cmd/client
           - goos: windows
             goarch: amd64
             name: client_windows.exe
+            cmd: ./cmd/client
           - goos: linux
             goarch: amd64
             name: server_linux
-            server: "true"
+            cmd: ./cmd/server
+
     steps:
       - uses: actions/checkout@v4
 
@@ -41,40 +46,37 @@ jobs:
           go-version: '1.23'
 
       - name: Build
-        env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm || '' }}
         run: |
-          if [ "${{ matrix.server }}" = "true" ]; then
-            go build -ldflags="-s -w" -o ${{ matrix.name }} ./cmd/server
-          else
-            go build -ldflags="-s -w" -o ${{ matrix.name }} ./cmd/client
-          fi
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm || '' }} \
+          go build -ldflags="-s -w" -o ${{ matrix.name }} ${{ matrix.cmd }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: go-${{ matrix.name }}
           path: ${{ matrix.name }}
 
-  # ── مرحله ۲: Build APK ────────────────────────────────────────────────────
+  # ── مرحله ۲: Build APK ──────────────────────────────────────────────────────
   build-apk:
     name: Build Android APK
     needs: build-go
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      # FIX: دانلود gradle-wrapper.jar معتبر — جایگزین فایل خالی در ریپو
-      - name: Fix gradle-wrapper.jar
+      # FIX: دانلود gradle-wrapper.jar معتبر از Maven Central
+      - name: Download gradle-wrapper.jar
         run: |
           mkdir -p gradle/wrapper
           curl -fsSL \
-            "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar" \
+            "https://repo1.maven.org/maven2/org/gradle/gradle-wrapper/8.4/gradle-wrapper-8.4.jar" \
+            -o gradle/wrapper/gradle-wrapper.jar || \
+          curl -fsSL \
+            "https://services.gradle.org/distributions/gradle-8.4-wrapper.jar" \
             -o gradle/wrapper/gradle-wrapper.jar
           ls -lh gradle/wrapper/gradle-wrapper.jar
 
+      # دانلود binary های Go
       - uses: actions/download-artifact@v4
         with:
           pattern: go-client_*
@@ -88,9 +90,8 @@ jobs:
             name=$(basename "$f")
             cp "$f" "app/src/main/assets/$name"
             chmod +x "app/src/main/assets/$name"
-            echo "Copied: $name"
+            echo "Copied: $name ($(du -h app/src/main/assets/$name | cut -f1))"
           done
-          ls -lh app/src/main/assets/
 
       - uses: actions/setup-java@v4
         with:
@@ -109,14 +110,13 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME:-dev}
           cp app/build/outputs/apk/debug/app-debug.apk FlowDriver-${VERSION}.apk
-          echo "APK: FlowDriver-${VERSION}.apk"
 
       - uses: actions/upload-artifact@v4
         with:
           name: FlowDriver-APK
           path: FlowDriver-*.apk
 
-  # ── مرحله ۳: Release ──────────────────────────────────────────────────────
+  # ── مرحله ۳: Release ────────────────────────────────────────────────────────
   release:
     name: Create Release
     needs: [build-go, build-apk]
