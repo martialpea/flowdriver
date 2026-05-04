@@ -42,21 +42,45 @@ func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, n
 	return ctx, nil, nil
 }
 
-// FIX: نام دقیق JNI = Java_ + package (نقطه‌ها به _) + کلاس + متد
-// package: com.flowdriver.service
-// class:   FlowBridge
-// method:  flowStart
+// FIX اصلی:
+// credFileC = مسیر credentials.json (client_id و client_secret)
+// tokenFileC = مسیر credentials.json.token (refresh_token)
+// Go در Login نگاه می‌کنه به: saPath = credFileC
+// و tokenCache رو از: saPath + ".token" = credFileC + ".token" می‌خونه
+// پس باید credFileC = "/data/.../credentials.json" باشه
+// و tokenFileC = "/data/.../credentials.json.token" باشه — یعنی همون path
 
-//export Java_com_flowdriver_service_FlowBridge_flowStart
-func Java_com_flowdriver_service_FlowBridge_flowStart(
+//export Java_com_flowdriver_service_FlowBridge_startTunnel
+func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	env uintptr,
 	obj uintptr,
-	configJsonPtr uintptr,
-	tokenJsonPtr uintptr,
-	credFilePtr uintptr,
+	configJsonC *C.char,
+	credFileC *C.char,
 ) int32 {
-	// چون JNIEnv در CGO پیچیده است، از روش دیگری استفاده می‌کنیم:
-	// Kotlin قبل از صدا زدن این تابع، string ها رو از طریق تابع helper ست می‌کنه
+	globalMu.Lock()
+	if running {
+		globalMu.Unlock()
+		return -1
+	}
+
+	configJson := C.GoString(configJsonC)
+	credFile   := C.GoString(credFileC)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	globalCancel = cancel
+	running = true
+	globalMu.Unlock()
+
+	err := runClient(ctx, configJson, credFile)
+
+	globalMu.Lock()
+	running = false
+	globalMu.Unlock()
+
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		return -2
+	}
 	return 0
 }
 
@@ -81,48 +105,6 @@ func Java_com_flowdriver_service_FlowBridge_flowIsRunning(env uintptr, obj uintp
 	return 0
 }
 
-// startTunnel: تابع اصلی که از Kotlin صدا زده می‌شه با string های C
-//
-//export Java_com_flowdriver_service_FlowBridge_startTunnel
-func Java_com_flowdriver_service_FlowBridge_startTunnel(
-	env uintptr,
-	obj uintptr,
-	configJsonC *C.char,
-	tokenJsonC *C.char,
-	credFileC *C.char,
-) int32 {
-	globalMu.Lock()
-	defer globalMu.Unlock()
-
-	if running {
-		return -1
-	}
-
-	configJson := C.GoString(configJsonC)
-	tokenJson  := C.GoString(tokenJsonC)
-	credFile   := C.GoString(credFileC)
-
-	_ = tokenJson // token از طریق credFile استفاده می‌شه
-
-	ctx, cancel := context.WithCancel(context.Background())
-	globalCancel = cancel
-	running = true
-
-	go func() {
-		defer func() {
-			globalMu.Lock()
-			running = false
-			globalMu.Unlock()
-			log.Println("[INFO] stopped")
-		}()
-		if err := runClient(ctx, configJson, credFile); err != nil {
-			log.Printf("[ERROR] %v", err)
-		}
-	}()
-
-	return 0
-}
-
 func runClient(ctx context.Context, configJson, credFilePath string) error {
 	cfg, err := config.FromJSON(configJson)
 	if err != nil {
@@ -130,14 +112,17 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 	}
 
 	hc := httpclient.NewCustomClient(cfg.Transport)
+	// FIX: credFilePath = مسیر credentials.json
+	// Go خودش credFilePath+".token" رو می‌خونه
 	backend := storage.NewGoogleBackend(hc, credFilePath, cfg.GoogleFolderID)
 
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer loginCancel()
+
 	if err := backend.Login(loginCtx); err != nil {
-		return fmt.Errorf("login: %w", err)
+		return fmt.Errorf("login failed: %w", err)
 	}
-	log.Println("[INFO] logged in")
+	log.Println("[INFO] login OK")
 
 	if cfg.GoogleFolderID == "" {
 		id, _ := backend.FindFolder(ctx, "Flow-Data")
@@ -193,14 +178,15 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 	)
 
 	log.Printf("[INFO] SOCKS5 on %s", listenAddr)
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe("tcp", listenAddr) }()
+
+	srvErr := make(chan error, 1)
+	go func() { srvErr <- srv.ListenAndServe("tcp", listenAddr) }()
 
 	select {
 	case <-ctx.Done():
 		return nil
-	case err := <-errCh:
-		return err
+	case err := <-srvErr:
+		return fmt.Errorf("socks5: %w", err)
 	}
 }
 

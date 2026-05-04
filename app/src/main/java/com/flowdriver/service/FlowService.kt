@@ -12,10 +12,12 @@ import androidx.core.app.NotificationCompat
 import com.flowdriver.ui.MainActivity
 import kotlinx.coroutines.*
 import java.io.File
+import java.util.concurrent.Executors
 
 class FlowService : Service() {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val jniExecutor = Executors.newSingleThreadExecutor()
 
     companion object {
         const val ACTION_START = "com.flowdriver.START"
@@ -53,57 +55,54 @@ class FlowService : Service() {
     }
 
     private fun startTunnel(configJson: String, tokenJson: String) {
-        scope.launch {
+        if (!FlowBridge.load()) {
+            appendLog("[ERROR] Cannot load libflowdriver.so")
+            stopSelf(); return
+        }
+
+        // FIX: ساختار فایل‌ها باید دقیقاً این باشه:
+        // filesDir/credentials.json       ← client_id و client_secret
+        // filesDir/credentials.json.token ← refresh_token
+        // Go به credFilePath = credentials.json نگاه می‌کنه
+        // و .token رو از credFilePath+".token" می‌خونه
+
+        val credFile  = File(filesDir, "credentials.json")
+        val tokenFile = File(filesDir, "credentials.json.token")
+
+        // ۱. نوشتن token
+        tokenFile.writeText(tokenJson)
+        appendLog("[INFO] Token written: ${tokenFile.absolutePath}")
+
+        // ۲. credentials.json از assets
+        if (!credFile.exists()) {
             try {
-                // بارگذاری library — اگه fail شد crash نمی‌کنه
-                if (!FlowBridge.load()) {
-                    appendLog("[ERROR] Cannot load libflowdriver.so")
-                    appendLog("[HINT]  APK باید از GitHub Actions build شده باشه")
-                    finishWithError()
-                    return@launch
-                }
+                assets.open("credentials.json").use { it.copyTo(credFile.outputStream()) }
+                appendLog("[INFO] credentials.json loaded from assets")
+            } catch (_: Exception) {
+                // اگه credentials.json در assets نبود، یه dummy بساز
+                // چون Go فقط client_id رو از اون می‌خونه و token داریم
+                credFile.writeText("""{"installed":{"client_id":"","client_secret":"","token_uri":"https://oauth2.googleapis.com/token","redirect_uris":["http://localhost"]}}""")
+                appendLog("[WARN] credentials.json not in assets, using dummy")
+            }
+        }
 
-                // ذخیره token در فایل
-                val tokenFile = File(filesDir, "credentials.json.token")
-                tokenFile.writeText(tokenJson)
+        appendLog("[INFO] credFile: ${credFile.absolutePath}")
+        appendLog("[INFO] tokenFile exists: ${tokenFile.exists()}")
 
-                // credentials.json از assets
-                val credFile = File(filesDir, "credentials.json")
-                if (!credFile.exists()) {
-                    try {
-                        assets.open("credentials.json").use { it.copyTo(credFile.outputStream()) }
-                    } catch (_: Exception) {}
-                }
+        isRunning = true
+        onStatusChange?.invoke(true)
+        updateNotification("در حال اتصال...")
 
-                val credPath = if (credFile.exists()) credFile.absolutePath else tokenFile.absolutePath
-
-                appendLog("[INFO] Starting JNI tunnel...")
-                updateNotification("در حال اتصال...")
-                isRunning = true
-                onStatusChange?.invoke(true)
-
-                // صدا زدن Go از JNI
-                val result = FlowBridge.startTunnel(configJson, tokenJson, credPath)
-                if (result != 0) {
-                    appendLog("[ERROR] startTunnel returned $result")
-                    finishWithError()
-                    return@launch
-                }
-
-                appendLog("[INFO] Tunnel started — SOCKS5 on 127.0.0.1:1080")
-                updateNotification("✓ متصل")
-
-                // polling تا stop
-                while (isRunning && FlowBridge.flowIsRunning() == 1) {
-                    delay(1000)
-                }
-
-            } catch (e: UnsatisfiedLinkError) {
-                appendLog("[ERROR] UnsatisfiedLinkError: ${e.message}")
-                appendLog("[HINT]  libflowdriver.so پیدا نشد در APK")
+        // blocking JNI در thread جداگانه
+        jniExecutor.submit {
+            try {
+                appendLog("[INFO] Calling JNI startTunnel...")
+                // فقط credFile پاس می‌کنیم — Go خودش .token رو می‌خونه
+                val result = FlowBridge.startTunnel(configJson, credFile.absolutePath)
+                appendLog("[INFO] Tunnel ended: $result")
             } catch (e: Exception) {
-                appendLog("[ERROR] ${e.javaClass.simpleName}: ${e.message}")
-                Log.e("FlowService", "tunnel error", e)
+                appendLog("[ERROR] JNI: ${e.message}")
+                Log.e("FlowService", "JNI error", e)
             } finally {
                 isRunning = false
                 onStatusChange?.invoke(false)
@@ -111,20 +110,22 @@ class FlowService : Service() {
                 stopSelf()
             }
         }
+
+        // نمایش وضعیت بعد از ۳ ثانیه
+        scope.launch {
+            delay(3000)
+            if (isRunning) {
+                appendLog("[INFO] ✓ SOCKS5 فعال روی 127.0.0.1:1080")
+                updateNotification("✓ متصل — SOCKS5:1080")
+            }
+        }
     }
 
     private fun stopTunnel() {
         appendLog("[INFO] Stopping...")
         try { FlowBridge.flowStop() } catch (e: Exception) {
-            Log.e("FlowService", "flowStop error", e)
+            Log.e("FlowService", "stop error", e)
         }
-        isRunning = false
-        onStatusChange?.invoke(false)
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-    }
-
-    private fun finishWithError() {
         isRunning = false
         onStatusChange?.invoke(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -169,6 +170,7 @@ class FlowService : Service() {
         super.onDestroy()
         try { FlowBridge.flowStop() } catch (_: Exception) {}
         scope.cancel()
+        jniExecutor.shutdown()
         isRunning = false
     }
 }
