@@ -58,3 +58,14 @@ func Load(path string) (*AppConfig, error) {
 
 	return &cfg, nil
 }
+
+// FromJSON برای استفاده از JNI — parse config از string به جای فایل
+func FromJSON(jsonStr string) (*AppConfig, error) {
+	var cfg AppConfig
+	if err := json.Unmarshal([]byte(jsonStr), &cfg); err != nil {
+		return nil, err
+	}
+	if cfg.RefreshRateMs == 0 { cfg.RefreshRateMs = 200 }
+	if cfg.FlushRateMs == 0   { cfg.FlushRateMs = 300 }
+	return &cfg, nil
+}
