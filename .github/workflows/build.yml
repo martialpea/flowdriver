@@ -64,19 +64,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # FIX: دانلود gradle-wrapper.jar معتبر از Maven Central
-      - name: Download gradle-wrapper.jar
-        run: |
-          mkdir -p gradle/wrapper
-          curl -fsSL \
-            "https://repo1.maven.org/maven2/org/gradle/gradle-wrapper/8.4/gradle-wrapper-8.4.jar" \
-            -o gradle/wrapper/gradle-wrapper.jar || \
-          curl -fsSL \
-            "https://services.gradle.org/distributions/gradle-8.4-wrapper.jar" \
-            -o gradle/wrapper/gradle-wrapper.jar
-          ls -lh gradle/wrapper/gradle-wrapper.jar
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-      # دانلود binary های Go
+      # FIX: این action هم gradle-wrapper.jar رو نصب می‌کنه هم Gradle رو
+      # نیازی به دانلود manual jar نیست
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
       - uses: actions/download-artifact@v4
         with:
           pattern: go-client_*
@@ -90,21 +92,12 @@ jobs:
             name=$(basename "$f")
             cp "$f" "app/src/main/assets/$name"
             chmod +x "app/src/main/assets/$name"
-            echo "Copied: $name ($(du -h app/src/main/assets/$name | cut -f1))"
+            echo "Copied: $name"
           done
 
-      - uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
+      # FIX: از gradle مستقیم استفاده می‌کنیم — نه gradlew
       - name: Build APK
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+        run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Rename APK
         run: |
