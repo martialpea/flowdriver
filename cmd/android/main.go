@@ -9,10 +9,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -28,7 +30,14 @@ var (
 	globalCancel context.CancelFunc
 	globalMu     sync.Mutex
 	running      bool
+	// callback برای ارسال لاگ به Kotlin
+	logCallback func(string)
 )
+
+func logf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	log.Println(msg)
+}
 
 func genID() string {
 	b := make([]byte, 16)
@@ -41,14 +50,6 @@ type rawResolver struct{}
 func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	return ctx, nil, nil
 }
-
-// FIX اصلی:
-// credFileC = مسیر credentials.json (client_id و client_secret)
-// tokenFileC = مسیر credentials.json.token (refresh_token)
-// Go در Login نگاه می‌کنه به: saPath = credFileC
-// و tokenCache رو از: saPath + ".token" = credFileC + ".token" می‌خونه
-// پس باید credFileC = "/data/.../credentials.json" باشه
-// و tokenFileC = "/data/.../credentials.json.token" باشه — یعنی همون path
 
 //export Java_com_flowdriver_service_FlowBridge_startTunnel
 func Java_com_flowdriver_service_FlowBridge_startTunnel(
@@ -78,7 +79,7 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	globalMu.Unlock()
 
 	if err != nil {
-		log.Printf("[ERROR] %v", err)
+		logf("[ERROR] %v", err)
 		return -2
 	}
 	return 0
@@ -106,32 +107,68 @@ func Java_com_flowdriver_service_FlowBridge_flowIsRunning(env uintptr, obj uintp
 }
 
 func runClient(ctx context.Context, configJson, credFilePath string) error {
-	cfg, err := config.FromJSON(configJson)
+	// ── ۱. بررسی فایل‌ها ─────────────────────────────────────────────────────
+	tokenPath := credFilePath + ".token"
+
+	logf("[DEBUG] credFile: %s", credFilePath)
+	logf("[DEBUG] tokenFile: %s", tokenPath)
+
+	// بررسی وجود token file
+	tokenData, err := os.ReadFile(tokenPath)
 	if err != nil {
-		return fmt.Errorf("config: %w", err)
+		return fmt.Errorf("token file not found at %s: %w", tokenPath, err)
 	}
 
+	// بررسی محتوای token
+	var tokenCheck struct {
+		RefreshToken string `json:"refresh_token"`
+		ClientID     string `json:"client_id"`
+		ClientSecret string `json:"client_secret"`
+	}
+	if err := json.Unmarshal(tokenData, &tokenCheck); err != nil {
+		return fmt.Errorf("token file invalid JSON: %w", err)
+	}
+	if tokenCheck.RefreshToken == "" {
+		return fmt.Errorf("token file missing refresh_token")
+	}
+	logf("[DEBUG] refresh_token: %s...", tokenCheck.RefreshToken[:20])
+	logf("[DEBUG] client_id present: %v", tokenCheck.ClientID != "")
+	logf("[DEBUG] client_secret present: %v", tokenCheck.ClientSecret != "")
+
+	// ── ۲. parse config ───────────────────────────────────────────────────────
+	cfg, err := config.FromJSON(configJson)
+	if err != nil {
+		return fmt.Errorf("config parse: %w", err)
+	}
+	logf("[DEBUG] folder_id: %s", cfg.GoogleFolderID)
+	logf("[DEBUG] transport.TargetIP: %s", cfg.Transport.TargetIP)
+
+	// ── ۳. login ──────────────────────────────────────────────────────────────
 	hc := httpclient.NewCustomClient(cfg.Transport)
-	// FIX: credFilePath = مسیر credentials.json
-	// Go خودش credFilePath+".token" رو می‌خونه
 	backend := storage.NewGoogleBackend(hc, credFilePath, cfg.GoogleFolderID)
 
+	logf("[INFO] Attempting login...")
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer loginCancel()
 
 	if err := backend.Login(loginCtx); err != nil {
-		return fmt.Errorf("login failed: %w", err)
+		return fmt.Errorf("login: %w", err)
 	}
-	log.Println("[INFO] login OK")
+	logf("[INFO] Login OK")
 
+	// ── ۴. folder ─────────────────────────────────────────────────────────────
 	if cfg.GoogleFolderID == "" {
+		logf("[INFO] Finding Drive folder...")
 		id, _ := backend.FindFolder(ctx, "Flow-Data")
 		if id == "" {
+			logf("[INFO] Creating Drive folder...")
 			id, _ = backend.CreateFolder(ctx, "Flow-Data")
 		}
 		cfg.GoogleFolderID = id
+		logf("[INFO] Folder ID: %s", id)
 	}
 
+	// ── ۵. engine ─────────────────────────────────────────────────────────────
 	cid := cfg.ClientID
 	if cid == "" {
 		cid = genID()[:8]
@@ -146,6 +183,7 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 	}
 	engine.Start(ctx)
 
+	// ── ۶. SOCKS5 ─────────────────────────────────────────────────────────────
 	listenAddr := cfg.ListenAddr
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1080"
@@ -155,7 +193,7 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 		socks5.WithResolver(rawResolver{}),
 		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
 			sid := genID()
-			log.Printf("[OK] %s -> %s", sid[:8], addr)
+			logf("[OK] session %s -> %s", sid[:8], addr)
 			s := transport.NewSession(sid)
 			s.TargetAddr = addr
 			engine.AddSession(s)
@@ -177,16 +215,17 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 		}),
 	)
 
-	log.Printf("[INFO] SOCKS5 on %s", listenAddr)
+	logf("[INFO] SOCKS5 listening on %s", listenAddr)
 
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.ListenAndServe("tcp", listenAddr) }()
 
 	select {
 	case <-ctx.Done():
+		logf("[INFO] stopped by context")
 		return nil
 	case err := <-srvErr:
-		return fmt.Errorf("socks5: %w", err)
+		return fmt.Errorf("socks5 server: %w", err)
 	}
 }
 
