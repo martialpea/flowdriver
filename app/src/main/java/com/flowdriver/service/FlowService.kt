@@ -33,7 +33,6 @@ class FlowService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        // باید فوری صدا زده بشه
         startForeground(NOTIF_ID, buildNotification("آماده اتصال..."))
     }
 
@@ -56,11 +55,9 @@ class FlowService : Service() {
     private fun startTunnel(configJson: String, tokenJson: String) {
         scope.launch {
             try {
-                // نوشتن token به filesDir برای Go
                 val tokenFile = File(filesDir, "credentials.json.token")
                 tokenFile.writeText(tokenJson)
 
-                // credentials.json از assets اگه داشتیم
                 val credFile = File(filesDir, "credentials.json")
                 if (!credFile.exists()) {
                     try {
@@ -68,31 +65,31 @@ class FlowService : Service() {
                     } catch (_: Exception) {}
                 }
 
-                appendLog("[INFO] Starting via JNI (no binary needed)...")
+                appendLog("[INFO] Starting via JNI...")
                 updateNotification("در حال اتصال...")
-
                 isRunning = true
                 onStatusChange?.invoke(true)
 
-                // اجرای Go مستقیم از JNI — بدون binary خارجی
-                val result = FlowBridge.start(
+                val result = FlowBridge.flowStart(
                     configJson,
                     tokenJson,
                     if (credFile.exists()) credFile.absolutePath else ""
                 )
 
                 if (result != 0) {
-                    appendLog("[ERROR] FlowBridge.start returned $result")
+                    appendLog("[ERROR] Start failed: $result")
+                    finishWithError()
+                    return@launch
                 }
 
-                // منتظر می‌مونیم تا stop صدا زده بشه
-                while (FlowBridge.isRunning() == 1) {
+                // منتظر stop
+                while (FlowBridge.flowIsRunning() == 1 && isRunning) {
                     delay(500)
-                    if (!isRunning) break
                 }
 
-                appendLog("[INFO] Tunnel stopped")
-
+            } catch (e: UnsatisfiedLinkError) {
+                appendLog("[ERROR] JNI library not loaded: ${e.message}")
+                appendLog("[HINT]  APK must be built with GitHub Actions")
             } catch (e: Exception) {
                 appendLog("[ERROR] ${e.javaClass.simpleName}: ${e.message}")
                 Log.e("FlowService", "error", e)
@@ -107,7 +104,14 @@ class FlowService : Service() {
 
     private fun stopTunnel() {
         appendLog("[INFO] Stopping...")
-        FlowBridge.stop()
+        try { FlowBridge.flowStop() } catch (_: Exception) {}
+        isRunning = false
+        onStatusChange?.invoke(false)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun finishWithError() {
         isRunning = false
         onStatusChange?.invoke(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -131,9 +135,10 @@ class FlowService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val pi = PendingIntent.getActivity(this, 0,
-            Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        return androidx.core.app.NotificationCompat.Builder(this, CHANNEL_ID)
+        val pi = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("FlowDriver")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
@@ -148,7 +153,7 @@ class FlowService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        FlowBridge.stop()
+        try { FlowBridge.flowStop() } catch (_: Exception) {}
         scope.cancel()
         isRunning = false
     }

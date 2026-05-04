@@ -1,12 +1,9 @@
 package main
 
 /*
-#cgo CFLAGS: -Wno-unused-parameter
-#include <jni.h>
 #include <stdlib.h>
 */
 import "C"
-
 import (
 	"context"
 	"crypto/rand"
@@ -44,33 +41,21 @@ func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, n
 	return ctx, nil, nil
 }
 
-//export Java_com_flowdriver_service_FlowBridge_start
-func Java_com_flowdriver_service_FlowBridge_start(
-	env *C.JNIEnv,
-	obj C.jobject,
-	configJsonC C.jstring,
-	tokenJsonC C.jstring,
-	credFileC C.jstring,
-) C.jint {
+// FIX: ساده‌ترین و مطمئن‌ترین روش — همه string ها به صورت *C.char
+// Kotlin طرف خودش با JNA/JNI string رو به byte array تبدیل می‌کنه
+
+//export flowStart
+func flowStart(configJsonC *C.char, tokenJsonC *C.char, credFileC *C.char) C.int {
 	globalMu.Lock()
 	defer globalMu.Unlock()
 
 	if running {
-		return C.jint(-1)
+		return C.int(-1)
 	}
 
-	// تبدیل jstring به Go string
-	cConfigJson := C.GetStringUTFChars(env, configJsonC, nil)
-	cTokenJson  := C.GetStringUTFChars(env, tokenJsonC, nil)
-	cCredFile   := C.GetStringUTFChars(env, credFileC, nil)
-
-	configJson := C.GoString(cConfigJson)
-	tokenJson  := C.GoString(cTokenJson)
-	credFile   := C.GoString(cCredFile)
-
-	C.ReleaseStringUTFChars(env, configJsonC, cConfigJson)
-	C.ReleaseStringUTFChars(env, tokenJsonC, cTokenJson)
-	C.ReleaseStringUTFChars(env, credFileC, cCredFile)
+	configJson := C.GoString(configJsonC)
+	tokenJson  := C.GoString(tokenJsonC)
+	credFile   := C.GoString(credFileC)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	globalCancel = cancel
@@ -88,11 +73,11 @@ func Java_com_flowdriver_service_FlowBridge_start(
 		}
 	}()
 
-	return C.jint(0)
+	return C.int(0)
 }
 
-//export Java_com_flowdriver_service_FlowBridge_stop
-func Java_com_flowdriver_service_FlowBridge_stop(env *C.JNIEnv, obj C.jobject) {
+//export flowStop
+func flowStop() {
 	globalMu.Lock()
 	defer globalMu.Unlock()
 	if globalCancel != nil {
@@ -102,14 +87,14 @@ func Java_com_flowdriver_service_FlowBridge_stop(env *C.JNIEnv, obj C.jobject) {
 	running = false
 }
 
-//export Java_com_flowdriver_service_FlowBridge_isRunning
-func Java_com_flowdriver_service_FlowBridge_isRunning(env *C.JNIEnv, obj C.jobject) C.jint {
+//export flowIsRunning
+func flowIsRunning() C.int {
 	globalMu.Lock()
 	defer globalMu.Unlock()
 	if running {
-		return C.jint(1)
+		return C.int(1)
 	}
-	return C.jint(0)
+	return C.int(0)
 }
 
 func runClient(ctx context.Context, configJson, tokenJson, credFilePath string) error {
