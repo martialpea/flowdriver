@@ -9,7 +9,6 @@ permissions:
   contents: write
 
 jobs:
-  # ── مرحله ۱: Build Go .so برای هر ABI ──────────────────────────────────────
   build-so:
     name: .so (${{ matrix.abi }})
     runs-on: ubuntu-latest
@@ -19,18 +18,15 @@ jobs:
           - abi: arm64-v8a
             goarch: arm64
             goarm: ""
-            triple: aarch64-linux-android
-            api: 21
+            cc_pattern: "aarch64-linux-android*-clang"
           - abi: armeabi-v7a
             goarch: arm
             goarm: "7"
-            triple: armv7a-linux-androideabi
-            api: 21
+            cc_pattern: "armv7a-linux-androideabi*-clang"
           - abi: x86_64
             goarch: amd64
             goarm: ""
-            triple: x86_64-linux-android
-            api: 21
+            cc_pattern: "x86_64-linux-android*-clang"
 
     steps:
       - uses: actions/checkout@v4
@@ -39,23 +35,19 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Install Android NDK
-        id: ndk
+      - name: Install NDK
         run: |
-          NDK_VERSION="r26d"
-          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
-          wget -q "https://dl.google.com/android/repository/${NDK_ZIP}"
-          unzip -q "${NDK_ZIP}"
-          NDK_HOME="$(pwd)/android-ndk-${NDK_VERSION}"
-          TOOLCHAIN="${NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "NDK_HOME=${NDK_HOME}" >> $GITHUB_ENV
+          NDK_VER="r26d"
+          wget -q "https://dl.google.com/android/repository/android-ndk-${NDK_VER}-linux.zip"
+          unzip -q "android-ndk-${NDK_VER}-linux.zip"
+          TOOLCHAIN="$(pwd)/android-ndk-${NDK_VER}/toolchains/llvm/prebuilt/linux-x86_64/bin"
           echo "TOOLCHAIN=${TOOLCHAIN}" >> $GITHUB_ENV
-          # FIX: نام دقیق CC برای هر triple
-          CC="${TOOLCHAIN}/${{ matrix.triple }}${{ matrix.api }}-clang"
+          # پیدا کردن نام دقیق clang برای این ABI
+          CC=$(ls ${TOOLCHAIN}/${{ matrix.cc_pattern }} | head -1)
           echo "CC=${CC}" >> $GITHUB_ENV
-          ls "${TOOLCHAIN}/${{ matrix.triple }}"* | head -3
+          echo "Found CC: ${CC}"
 
-      - name: Build libflowdriver.so
+      - name: Build .so
         env:
           CGO_ENABLED: "1"
           GOOS: android
@@ -65,9 +57,8 @@ jobs:
           go build \
             -buildmode=c-shared \
             -ldflags="-s -w" \
-            -o "libflowdriver.so" \
+            -o libflowdriver.so \
             ./cmd/android
-
           ls -lh libflowdriver.so
 
       - uses: actions/upload-artifact@v4
@@ -75,31 +66,12 @@ jobs:
           name: so-${{ matrix.abi }}
           path: libflowdriver.so
 
-  # ── مرحله ۲: Build APK ──────────────────────────────────────────────────────
   build-apk:
     name: Build APK
     needs: build-so
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # دانلود gradle-wrapper.jar از Gradle releases
-      - name: Setup Gradle wrapper
-        run: |
-          mkdir -p gradle/wrapper
-          # دانلود از GitHub Gradle releases (آدرس معتبر)
-          curl -fsSL \
-            "https://github.com/gradle/gradle/releases/download/v8.4.0/gradle-8.4-wrapper.jar" \
-            -o gradle/wrapper/gradle-wrapper.jar 2>/dev/null || \
-          # Fallback: از services.gradle.org
-          curl -fsSL \
-            "https://services.gradle.org/distributions/gradle-8.4-bin.zip" \
-            -o /tmp/gradle.zip && \
-          unzip -j /tmp/gradle.zip "*/lib/gradle-launcher-*.jar" -d /tmp/glibs/ && \
-          cp /tmp/glibs/*.jar gradle/wrapper/gradle-wrapper.jar || true
-
-          # اگه هیچکدام کار نکرد، از gradle/actions استفاده می‌کنیم
-          ls -lh gradle/wrapper/gradle-wrapper.jar 2>/dev/null || echo "jar not found, will use setup-gradle"
 
       - uses: gradle/actions/setup-gradle@v3
         with:
@@ -116,7 +88,7 @@ jobs:
           cp so-artifacts/so-arm64-v8a/libflowdriver.so   app/src/main/jniLibs/arm64-v8a/
           cp so-artifacts/so-armeabi-v7a/libflowdriver.so app/src/main/jniLibs/armeabi-v7a/
           cp so-artifacts/so-x86_64/libflowdriver.so      app/src/main/jniLibs/x86_64/
-          find app/src/main/jniLibs -name "*.so" -exec ls -lh {} \;
+          find app/src/main/jniLibs -name "*.so" | xargs ls -lh
 
       - uses: actions/setup-java@v4
         with:
@@ -138,7 +110,6 @@ jobs:
           name: FlowDriver-APK
           path: FlowDriver-*.apk
 
-  # ── مرحله ۳: PC binaries ────────────────────────────────────────────────────
   build-pc:
     name: PC (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -166,7 +137,6 @@ jobs:
           name: pc-${{ matrix.name }}
           path: ${{ matrix.name }}
 
-  # ── مرحله ۴: Release ────────────────────────────────────────────────────────
   release:
     name: Release
     needs: [build-apk, build-pc]
