@@ -42,7 +42,6 @@ jobs:
           unzip -q "android-ndk-${NDK_VER}-linux.zip"
           TOOLCHAIN="$(pwd)/android-ndk-${NDK_VER}/toolchains/llvm/prebuilt/linux-x86_64/bin"
           echo "TOOLCHAIN=${TOOLCHAIN}" >> $GITHUB_ENV
-          # پیدا کردن نام دقیق clang برای این ABI
           CC=$(ls ${TOOLCHAIN}/${{ matrix.cc_pattern }} | head -1)
           echo "CC=${CC}" >> $GITHUB_ENV
           echo "Found CC: ${CC}"
@@ -88,6 +87,7 @@ jobs:
           cp so-artifacts/so-arm64-v8a/libflowdriver.so   app/src/main/jniLibs/arm64-v8a/
           cp so-artifacts/so-armeabi-v7a/libflowdriver.so app/src/main/jniLibs/armeabi-v7a/
           cp so-artifacts/so-x86_64/libflowdriver.so      app/src/main/jniLibs/x86_64/
+          echo "JNI libs:"
           find app/src/main/jniLibs -name "*.so" | xargs ls -lh
 
       - uses: actions/setup-java@v4
