@@ -216,7 +216,35 @@ func (b *GoogleBackend) exchangeCode(ctx context.Context, code string) error {
 	v.Set("client_id", b.clientID)
 	v.Set("client_secret", b.clientSecret)
 	v.Set("redirect_uri", b.redirectURI)
-	return b.executeTokenRequest(ctx, v)
+	req, err := http.NewRequestWithContext(ctx, "POST", b.tokenURI, strings.NewReader(v.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[LOGIN] exchange response %d: %s\n", resp.StatusCode, string(body))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("exchange %d: %s", resp.StatusCode, string(body))
+	}
+	var res struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		return err
+	}
+	b.token = res.AccessToken
+	if res.RefreshToken != "" {
+		b.refreshToken = res.RefreshToken
+	}
+	b.tokenEx = time.Now().Add(time.Duration(res.ExpiresIn-60) * time.Second)
+	return nil
 }
 
 func (b *GoogleBackend) refreshAccessToken(ctx context.Context) error {
