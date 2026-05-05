@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -29,7 +30,30 @@ var (
 	globalCancel context.CancelFunc
 	globalMu     sync.Mutex
 	running      bool
+	// لاگ‌های Go رو در این buffer نگه می‌داریم
+	logBuf   []string
+	logBufMu sync.Mutex
 )
+
+func init() {
+	// هدایت log به buffer + stderr
+	log.SetOutput(&logWriter{})
+	log.SetFlags(log.Ltime)
+}
+
+type logWriter struct{}
+
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	msg := string(p)
+	logBufMu.Lock()
+	logBuf = append(logBuf, msg)
+	if len(logBuf) > 500 {
+		logBuf = logBuf[len(logBuf)-500:]
+	}
+	logBufMu.Unlock()
+	os.Stderr.Write(p)
+	return len(p), nil
+}
 
 func genID() string {
 	b := make([]byte, 16)
@@ -56,7 +80,6 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 		globalMu.Unlock()
 		return -1
 	}
-
 	configJson := C.GoString(configJsonC)
 	credFile   := C.GoString(credFileC)
 	tokenFile  := C.GoString(tokenFileC)
@@ -103,20 +126,34 @@ func Java_com_flowdriver_service_FlowBridge_flowIsRunning(env uintptr, obj uintp
 	return 0
 }
 
+// getLog: لاگ‌های انباشته شده رو به Kotlin برمی‌گردونه
+//
+//export Java_com_flowdriver_service_FlowBridge_getLog
+func Java_com_flowdriver_service_FlowBridge_getLog(env uintptr, obj uintptr) *C.char {
+	logBufMu.Lock()
+	defer logBufMu.Unlock()
+	if len(logBuf) == 0 {
+		return C.CString("")
+	}
+	result := ""
+	for _, l := range logBuf {
+		result += l
+	}
+	logBuf = nil
+	return C.CString(result)
+}
+
 func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath string) error {
 	cfg, err := config.FromJSON(configJson)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
 
-	// FIX: برای login از http.Client معمولی استفاده کن
-	// نه از transport سفارشی که TargetIP داره
-	// چون TargetIP=216.239.38.120 فقط برای googleapis.com drive API هست
-	// و oauth2.googleapis.com آدرس متفاوتی داره
+	// FIX: برای OAuth از plain HTTP استفاده کن
 	plainClient := &http.Client{Timeout: 30 * time.Second}
 	backend := storage.NewGoogleBackendWithToken(plainClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
 
-	log.Println("[INFO] Logging in with plain HTTP client...")
+	log.Println("[INFO] Starting login...")
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer loginCancel()
 
@@ -125,10 +162,9 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 	}
 	log.Println("[INFO] Login OK!")
 
-	// بعد از login، برای Drive API از transport سفارشی استفاده کن
+	// برای Drive API از custom transport
 	customClient := httpclient.NewCustomClient(cfg.Transport)
 	driveBackend := storage.NewGoogleBackendWithToken(customClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
-	// token رو از backend اول کپی کن
 	driveBackend.CopyTokenFrom(backend)
 
 	if cfg.GoogleFolderID == "" {

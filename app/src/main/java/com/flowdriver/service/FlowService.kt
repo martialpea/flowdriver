@@ -60,25 +60,34 @@ class FlowService : Service() {
             stopSelf(); return
         }
 
-        // credentials.json — از filesDir (کاربر import کرده)
         val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
 
         if (!credFile.exists()) {
-            appendLog("[ERROR] credentials.json پیدا نشد")
-            appendLog("[HINT]  لطفاً credentials.json را import کنید")
+            appendLog("[ERROR] credentials.json پیدا نشد — import کنید")
             stopSelf(); return
         }
 
-        // نوشتن token
         tokenFile.writeText(tokenJson)
-
-        appendLog("[INFO] cred: ${credFile.absolutePath}")
-        appendLog("[INFO] token: ${tokenFile.absolutePath}")
 
         isRunning = true
         onStatusChange?.invoke(true)
         updateNotification("در حال اتصال...")
+
+        // polling لاگ‌های Go هر ۵۰۰ms
+        scope.launch {
+            while (isRunning) {
+                delay(500)
+                try {
+                    val logs = FlowBridge.getLog()
+                    if (logs.isNotEmpty()) {
+                        logs.trim().lines().forEach { line ->
+                            if (line.isNotBlank()) appendLog(line)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
 
         jniExecutor.submit {
             try {
@@ -88,9 +97,18 @@ class FlowService : Service() {
                     tokenFile.absolutePath
                 )
                 appendLog("[INFO] Tunnel ended: $result")
-                if (result == -2) appendLog("[HINT] Login failed — فایل‌ها را دوباره import کنید")
+                if (result == -2) {
+                    appendLog("[ERROR] Login failed")
+                    // لاگ آخر رو هم بگیر
+                    val lastLogs = FlowBridge.getLog()
+                    if (lastLogs.isNotEmpty()) {
+                        lastLogs.trim().lines().forEach { line ->
+                            if (line.isNotBlank()) appendLog(line)
+                        }
+                    }
+                }
             } catch (e: Exception) {
-                appendLog("[ERROR] ${e.message}")
+                appendLog("[ERROR] JNI: ${e.message}")
                 Log.e("FlowService", "JNI error", e)
             } finally {
                 isRunning = false
@@ -101,7 +119,7 @@ class FlowService : Service() {
         }
 
         scope.launch {
-            delay(4000)
+            delay(5000)
             if (isRunning) {
                 appendLog("[INFO] ✓ SOCKS5 فعال روی 127.0.0.1:1080")
                 updateNotification("✓ متصل")

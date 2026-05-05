@@ -15,8 +15,9 @@ object FlowBridge {
         }
     }
 
-    // FIX: هر دو فایل جداگانه پاس می‌شن
     external fun startTunnel(configJson: String, credFilePath: String, tokenFilePath: String): Int
     external fun flowStop()
     external fun flowIsRunning(): Int
+    // لاگ‌های Go رو می‌گیریم
+    external fun getLog(): String
 }

@@ -155,9 +155,9 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 		}
 	}
 
-	fmt.Printf("[LOGIN] client_id=%s\n", safeStr(b.clientID, 15))
-	fmt.Printf("[LOGIN] client_secret=%s\n", safeStr(b.clientSecret, 8))
-	fmt.Printf("[LOGIN] refresh_token=%s\n", safeStr(b.refreshToken, 20))
+	log.Printf("[LOGIN] client_id=%s\n", safeStr(b.clientID, 15))
+	log.Printf("[LOGIN] client_secret=%s\n", safeStr(b.clientSecret, 8))
+	log.Printf("[LOGIN] refresh_token=%s\n", safeStr(b.refreshToken, 20))
 
 	if b.refreshToken != "" && b.clientID != "" && b.clientSecret != "" {
 		return b.doRefreshWithRetry(ctx)
@@ -172,7 +172,7 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 		"https://accounts.google.com/o/oauth2/auth?client_id=%s&redirect_uri=%s&response_type=code&scope=https://www.googleapis.com/auth/drive.file&access_type=offline",
 		url.QueryEscape(b.clientID), url.QueryEscape(b.redirectURI),
 	)
-	fmt.Printf("\nOpen: %s\nCode: ", link)
+	log.Printf("Open: %s\nCode: ", link)
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
@@ -215,7 +215,7 @@ func (b *GoogleBackend) doRefreshWithRetry(ctx context.Context) error {
 			return err
 		}
 		wait := time.Duration(1<<uint(attempt)) * time.Second
-		fmt.Printf("[LOGIN] retry %d in %s: %v\n", attempt+1, wait, err)
+		log.Printf("[LOGIN] retry %d in %s: %v\n", attempt+1, wait, err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -246,7 +246,7 @@ func (b *GoogleBackend) doRefreshToken(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("[LOGIN] token response %d: %.200s\n", resp.StatusCode, string(body))
+	log.Printf("[LOGIN] token response %d: %.200s\n", resp.StatusCode, string(body))
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("token %d: %s", resp.StatusCode, string(body))
