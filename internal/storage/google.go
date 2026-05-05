@@ -58,19 +58,17 @@ func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBacke
 	}
 }
 
-// NewGoogleBackendWithToken: هر دو فایل رو جداگانه می‌گیره
-// credPath  = credentials.json (client_id و client_secret)
-// tokenPath = credentials.json.token (refresh_token)
 func NewGoogleBackendWithToken(client *http.Client, credPath, tokenPath, folderID string) *GoogleBackend {
 	b := &GoogleBackend{
 		httpClient: client,
-		// FIX: saPath رو روی tokenPath بذار بدون .token
-		// چون Login میاد saPath+".token" رو می‌خونه
+		// saPath باید بدون .token باشه
 		saPath:   strings.TrimSuffix(tokenPath, ".token"),
 		folderID: folderID,
 		fileIDs:  make(map[string]string),
+		tokenURI: "https://oauth2.googleapis.com/token",
 	}
-	// از credPath فقط client_id و client_secret می‌خونیم
+
+	// خواندن credentials.json
 	if data, err := os.ReadFile(credPath); err == nil {
 		var cred oauthClientJSON
 		if json.Unmarshal(data, &cred) == nil {
@@ -81,6 +79,19 @@ func NewGoogleBackendWithToken(client *http.Client, credPath, tokenPath, folderI
 			}
 		}
 	}
+
+	// خواندن token file
+	if data, err := os.ReadFile(tokenPath); err == nil {
+		var tc tokenCache
+		if json.Unmarshal(data, &tc) == nil {
+			b.refreshToken = tc.RefreshToken
+			if tc.ClientID != "" {
+				b.clientID = tc.ClientID
+				b.clientSecret = tc.ClientSecret
+			}
+		}
+	}
+
 	return b
 }
 
@@ -95,8 +106,10 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 
 	tokenCachePath := b.saPath + ".token"
 
-	// خواندن credentials.json برای client_id و client_secret
-	if b.clientID == "" {
+	// اگه از NewGoogleBackendWithToken اومدیم، client_id و refresh_token
+	// قبلاً set شدن — فقط بررسی می‌کنیم
+	if b.clientID == "" || b.clientSecret == "" {
+		// سعی کن از credentials.json بخون
 		if data, err := os.ReadFile(b.saPath); err == nil {
 			var cred oauthClientJSON
 			if json.Unmarshal(data, &cred) == nil && cred.Installed.ClientID != "" {
@@ -105,43 +118,46 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 				if cred.Installed.TokenURI != "" {
 					b.tokenURI = cred.Installed.TokenURI
 				}
-				if len(cred.Installed.RedirectURIs) > 0 {
-					b.redirectURI = cred.Installed.RedirectURIs[0]
+			}
+		}
+	}
+
+	if b.refreshToken == "" {
+		// سعی کن از token file بخون
+		if data, err := os.ReadFile(tokenCachePath); err == nil {
+			var tc tokenCache
+			if json.Unmarshal(data, &tc) == nil {
+				b.refreshToken = tc.RefreshToken
+				if tc.ClientID != "" && b.clientID == "" {
+					b.clientID = tc.ClientID
+					b.clientSecret = tc.ClientSecret
 				}
 			}
 		}
 	}
 
-	// خواندن token file
-	if cacheData, err := os.ReadFile(tokenCachePath); err == nil {
-		var cache tokenCache
-		if json.Unmarshal(cacheData, &cache) == nil && cache.RefreshToken != "" {
-			b.refreshToken = cache.RefreshToken
-			// اگه token file این مقادیر رو داشت override کن
-			if cache.ClientID != "" {
-				b.clientID = cache.ClientID
-				b.clientSecret = cache.ClientSecret
-			}
-		}
-	}
+	// لاگ وضعیت
+	fmt.Printf("[LOGIN] client_id=%s...\n", safePrefix(b.clientID, 20))
+	fmt.Printf("[LOGIN] client_secret=%s...\n", safePrefix(b.clientSecret, 10))
+	fmt.Printf("[LOGIN] refresh_token=%s...\n", safePrefix(b.refreshToken, 20))
+	fmt.Printf("[LOGIN] token_uri=%s\n", b.tokenURI)
 
-	// اگه refresh_token داریم، refresh کن
 	if b.refreshToken != "" && b.clientID != "" && b.clientSecret != "" {
 		if err := b.refreshWithRetry(ctx); err != nil {
-			return fmt.Errorf("token refresh failed (client_id=%s): %w", b.clientID[:10]+"...", err)
+			return fmt.Errorf("token refresh: %w", err)
 		}
 		return nil
 	}
 
-	if b.refreshToken != "" && (b.clientID == "" || b.clientSecret == "") {
-		return fmt.Errorf("refresh_token found but client_id or client_secret missing")
+	if b.refreshToken != "" {
+		return fmt.Errorf("refresh_token OK but client_id=%q client_secret=%q",
+			safePrefix(b.clientID, 5), safePrefix(b.clientSecret, 5))
 	}
 
-	// Interactive OAuth — فقط روی PC
-	authURI := "https://accounts.google.com/o/oauth2/auth"
-	link := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=https://www.googleapis.com/auth/drive.file&access_type=offline",
-		authURI, url.QueryEscape(b.clientID), url.QueryEscape(b.redirectURI))
-	fmt.Printf("\nOpen this URL:\n%s\n\nEnter code: ", link)
+	// Interactive OAuth — فقط PC
+	link := fmt.Sprintf("https://accounts.google.com/o/oauth2/auth?client_id=%s&redirect_uri=%s&response_type=code&scope=https://www.googleapis.com/auth/drive.file&access_type=offline",
+		url.QueryEscape(b.clientID), url.QueryEscape(b.redirectURI))
+	fmt.Printf("\nOpen: %s\nCode: ", link)
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
@@ -161,19 +177,29 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 		ClientID:     b.clientID,
 		ClientSecret: b.clientSecret,
 	}
-	cacheBytes, _ := json.MarshalIndent(cache, "", "  ")
-	os.WriteFile(tokenCachePath, cacheBytes, 0600)
+	data, _ := json.MarshalIndent(cache, "", "  ")
+	os.WriteFile(tokenCachePath, data, 0600)
 	return nil
+}
+
+func safePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 func (b *GoogleBackend) refreshWithRetry(ctx context.Context) error {
 	for attempt := 0; attempt < 4; attempt++ {
-		if err := b.refreshAccessToken(ctx); err == nil {
+		err := b.refreshAccessToken(ctx)
+		if err == nil {
 			return nil
-		} else if attempt == 3 {
+		}
+		if attempt == 3 {
 			return err
 		}
 		wait := time.Duration(1<<uint(attempt)) * time.Second
+		fmt.Printf("[LOGIN] retry %d after %s: %v\n", attempt+1, wait, err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -199,10 +225,6 @@ func (b *GoogleBackend) refreshAccessToken(ctx context.Context) error {
 	v.Set("refresh_token", b.refreshToken)
 	v.Set("client_id", b.clientID)
 	v.Set("client_secret", b.clientSecret)
-	return b.executeTokenRequest(ctx, v)
-}
-
-func (b *GoogleBackend) executeTokenRequest(ctx context.Context, v url.Values) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", b.tokenURI, strings.NewReader(v.Encode()))
 	if err != nil {
 		return err
@@ -210,11 +232,12 @@ func (b *GoogleBackend) executeTokenRequest(ctx context.Context, v url.Values) e
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("token request: %w", err)
+		return fmt.Errorf("http: %w", err)
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[LOGIN] token response %d: %s\n", resp.StatusCode, string(body))
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("token %d: %s", resp.StatusCode, string(body))
 	}
 	var res struct {
@@ -222,7 +245,7 @@ func (b *GoogleBackend) executeTokenRequest(ctx context.Context, v url.Values) e
 		RefreshToken string `json:"refresh_token"`
 		ExpiresIn    int    `json:"expires_in"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+	if err := json.Unmarshal(body, &res); err != nil {
 		return err
 	}
 	b.token = res.AccessToken
@@ -344,7 +367,7 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 	fileID, ok := b.fileIDs[filename]
 	b.fileIdsMu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("file-id not found: %s", filename)
+		return nil, fmt.Errorf("not found: %s", filename)
 	}
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
@@ -458,4 +481,19 @@ func (b *GoogleBackend) FindFolder(ctx context.Context, name string) (string, er
 		return res.Files[0].ID, nil
 	}
 	return "", nil
+}
+
+// CopyTokenFrom: token رو از یه backend دیگه کپی می‌کنه
+// برای اینکه بعد از login با plain client، از token در custom client هم استفاده کنیم
+func (b *GoogleBackend) CopyTokenFrom(src *GoogleBackend) {
+	src.mu.Lock()
+	defer src.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.token        = src.token
+	b.refreshToken = src.refreshToken
+	b.tokenEx      = src.tokenEx
+	b.clientID     = src.clientID
+	b.clientSecret = src.clientSecret
+	b.tokenURI     = src.tokenURI
 }

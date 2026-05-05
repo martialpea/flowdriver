@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -42,10 +43,6 @@ func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, n
 	return ctx, nil, nil
 }
 
-// FIX: هر دو فایل رو جداگانه می‌گیره
-// credFileC  = مسیر credentials.json
-// tokenFileC = مسیر credentials.json.token
-//
 //export Java_com_flowdriver_service_FlowBridge_startTunnel
 func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	env uintptr,
@@ -112,24 +109,32 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		return fmt.Errorf("config: %w", err)
 	}
 
-	hc := httpclient.NewCustomClient(cfg.Transport)
+	// FIX: برای login از http.Client معمولی استفاده کن
+	// نه از transport سفارشی که TargetIP داره
+	// چون TargetIP=216.239.38.120 فقط برای googleapis.com drive API هست
+	// و oauth2.googleapis.com آدرس متفاوتی داره
+	plainClient := &http.Client{Timeout: 30 * time.Second}
+	backend := storage.NewGoogleBackendWithToken(plainClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
 
-	// FIX: استفاده از NewGoogleBackendWithToken که هر دو فایل رو جداگانه می‌گیره
-	backend := storage.NewGoogleBackendWithToken(hc, credFilePath, tokenFilePath, cfg.GoogleFolderID)
-
-	log.Println("[INFO] Logging in...")
+	log.Println("[INFO] Logging in with plain HTTP client...")
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer loginCancel()
 
 	if err := backend.Login(loginCtx); err != nil {
 		return fmt.Errorf("login: %w", err)
 	}
-	log.Println("[INFO] Login OK")
+	log.Println("[INFO] Login OK!")
+
+	// بعد از login، برای Drive API از transport سفارشی استفاده کن
+	customClient := httpclient.NewCustomClient(cfg.Transport)
+	driveBackend := storage.NewGoogleBackendWithToken(customClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
+	// token رو از backend اول کپی کن
+	driveBackend.CopyTokenFrom(backend)
 
 	if cfg.GoogleFolderID == "" {
-		id, _ := backend.FindFolder(ctx, "Flow-Data")
+		id, _ := driveBackend.FindFolder(ctx, "Flow-Data")
 		if id == "" {
-			id, _ = backend.CreateFolder(ctx, "Flow-Data")
+			id, _ = driveBackend.CreateFolder(ctx, "Flow-Data")
 		}
 		cfg.GoogleFolderID = id
 		log.Printf("[INFO] Folder: %s", id)
@@ -140,7 +145,7 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		cid = genID()[:8]
 	}
 
-	engine := transport.NewEngine(backend, true, cid)
+	engine := transport.NewEngine(driveBackend, true, cid)
 	if cfg.RefreshRateMs > 0 {
 		engine.SetPollRate(cfg.RefreshRateMs)
 	}
