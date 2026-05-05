@@ -1,7 +1,6 @@
 package com.flowdriver.service
 
 object FlowBridge {
-
     private var loaded = false
 
     fun load(): Boolean {
@@ -16,10 +15,8 @@ object FlowBridge {
         }
     }
 
-    // FIX: فقط configJson و credFilePath — نه tokenJson جداگانه
-    // credFilePath = مسیر credentials.json
-    // Go خودش credFilePath+".token" رو می‌خونه
-    external fun startTunnel(configJson: String, credFilePath: String): Int
+    // FIX: هر دو فایل جداگانه پاس می‌شن
+    external fun startTunnel(configJson: String, credFilePath: String, tokenFilePath: String): Int
     external fun flowStop()
     external fun flowIsRunning(): Int
 }

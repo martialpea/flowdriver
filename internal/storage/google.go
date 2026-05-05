@@ -27,8 +27,6 @@ type oauthClientJSON struct {
 	} `json:"installed"`
 }
 
-// FIX: tokenCache الان client_id و client_secret هم داره
-// این مقادیر موقع اولین login روی PC ذخیره می‌شن
 type tokenCache struct {
 	RefreshToken string `json:"refresh_token"`
 	ClientID     string `json:"client_id,omitempty"`
@@ -36,22 +34,19 @@ type tokenCache struct {
 }
 
 type GoogleBackend struct {
-	httpClient *http.Client
-	saPath     string
-	folderID   string
-
+	httpClient   *http.Client
+	saPath       string
+	folderID     string
 	clientID     string
 	clientSecret string
 	tokenURI     string
 	redirectURI  string
-
 	token        string
 	refreshToken string
 	tokenEx      time.Time
 	mu           sync.Mutex
-
-	fileIDs   map[string]string
-	fileIdsMu sync.RWMutex
+	fileIDs      map[string]string
+	fileIdsMu    sync.RWMutex
 }
 
 func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBackend {
@@ -63,22 +58,66 @@ func NewGoogleBackend(client *http.Client, saPath, folderID string) *GoogleBacke
 	}
 }
 
+// NewGoogleBackendWithToken: هر دو فایل رو جداگانه می‌گیره
+// credPath  = credentials.json (client_id و client_secret)
+// tokenPath = credentials.json.token (refresh_token)
+func NewGoogleBackendWithToken(client *http.Client, credPath, tokenPath, folderID string) *GoogleBackend {
+	b := &GoogleBackend{
+		httpClient: client,
+		// FIX: saPath رو روی tokenPath بذار بدون .token
+		// چون Login میاد saPath+".token" رو می‌خونه
+		saPath:   strings.TrimSuffix(tokenPath, ".token"),
+		folderID: folderID,
+		fileIDs:  make(map[string]string),
+	}
+	// از credPath فقط client_id و client_secret می‌خونیم
+	if data, err := os.ReadFile(credPath); err == nil {
+		var cred oauthClientJSON
+		if json.Unmarshal(data, &cred) == nil {
+			b.clientID = cred.Installed.ClientID
+			b.clientSecret = cred.Installed.ClientSecret
+			if cred.Installed.TokenURI != "" {
+				b.tokenURI = cred.Installed.TokenURI
+			}
+		}
+	}
+	return b
+}
+
 func (b *GoogleBackend) Login(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.tokenURI = "https://oauth2.googleapis.com/token"
+	if b.tokenURI == "" {
+		b.tokenURI = "https://oauth2.googleapis.com/token"
+	}
 	b.redirectURI = "http://localhost"
 
 	tokenCachePath := b.saPath + ".token"
 
-	// FIX: اول token file رو بخون
-	// token file ممکنه client_id و client_secret هم داشته باشه
+	// خواندن credentials.json برای client_id و client_secret
+	if b.clientID == "" {
+		if data, err := os.ReadFile(b.saPath); err == nil {
+			var cred oauthClientJSON
+			if json.Unmarshal(data, &cred) == nil && cred.Installed.ClientID != "" {
+				b.clientID = cred.Installed.ClientID
+				b.clientSecret = cred.Installed.ClientSecret
+				if cred.Installed.TokenURI != "" {
+					b.tokenURI = cred.Installed.TokenURI
+				}
+				if len(cred.Installed.RedirectURIs) > 0 {
+					b.redirectURI = cred.Installed.RedirectURIs[0]
+				}
+			}
+		}
+	}
+
+	// خواندن token file
 	if cacheData, err := os.ReadFile(tokenCachePath); err == nil {
 		var cache tokenCache
-		if err := json.Unmarshal(cacheData, &cache); err == nil && cache.RefreshToken != "" {
+		if json.Unmarshal(cacheData, &cache) == nil && cache.RefreshToken != "" {
 			b.refreshToken = cache.RefreshToken
-			// اگه token file این مقادیر رو داشت، از اونها استفاده کن
+			// اگه token file این مقادیر رو داشت override کن
 			if cache.ClientID != "" {
 				b.clientID = cache.ClientID
 				b.clientSecret = cache.ClientSecret
@@ -86,64 +125,37 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 		}
 	}
 
-	// credentials.json رو بخون (اگه وجود داشت)
-	if data, err := os.ReadFile(b.saPath); err == nil {
-		var oauthJSON oauthClientJSON
-		if json.Unmarshal(data, &oauthJSON) == nil {
-			if oauthJSON.Installed.ClientID != "" {
-				b.clientID = oauthJSON.Installed.ClientID
-				b.clientSecret = oauthJSON.Installed.ClientSecret
-			}
-			if oauthJSON.Installed.TokenURI != "" {
-				b.tokenURI = oauthJSON.Installed.TokenURI
-			}
-			if len(oauthJSON.Installed.RedirectURIs) > 0 {
-				b.redirectURI = oauthJSON.Installed.RedirectURIs[0]
-			}
-		}
-	}
-
-	// اگه refresh_token داریم، سعی کن refresh کنی
+	// اگه refresh_token داریم، refresh کن
 	if b.refreshToken != "" && b.clientID != "" && b.clientSecret != "" {
 		if err := b.refreshWithRetry(ctx); err != nil {
-			return fmt.Errorf("token refresh failed: %w", err)
+			return fmt.Errorf("token refresh failed (client_id=%s): %w", b.clientID[:10]+"...", err)
 		}
 		return nil
 	}
 
-	// اگه refresh_token داریم ولی client_id نداریم
-	if b.refreshToken != "" {
-		return fmt.Errorf("refresh_token found but client_id/secret missing — please include credentials.json")
+	if b.refreshToken != "" && (b.clientID == "" || b.clientSecret == "") {
+		return fmt.Errorf("refresh_token found but client_id or client_secret missing")
 	}
 
-	// هیچ token ای نداریم — interactive OAuth (فقط روی PC کار می‌کنه)
+	// Interactive OAuth — فقط روی PC
 	authURI := "https://accounts.google.com/o/oauth2/auth"
 	link := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=https://www.googleapis.com/auth/drive.file&access_type=offline",
 		authURI, url.QueryEscape(b.clientID), url.QueryEscape(b.redirectURI))
-
-	fmt.Printf("\n==================== OAUTH AUTHENTICATION REQUIRED ====================\n")
-	fmt.Printf("Open this URL:\n\n%s\n\n", link)
-	fmt.Printf("Enter URL or Code: ")
-
+	fmt.Printf("\nOpen this URL:\n%s\n\nEnter code: ", link)
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
-
 	code := input
 	if strings.HasPrefix(input, "http") {
 		if u, err := url.Parse(input); err == nil {
-			if qCode := u.Query().Get("code"); qCode != "" {
-				code = qCode
+			if q := u.Query().Get("code"); q != "" {
+				code = q
 			}
 		}
 	}
-
 	if err := b.exchangeCode(ctx, code); err != nil {
 		return err
 	}
-
-	// FIX: ذخیره client_id و client_secret در token file
-	// این باعث می‌شه روی اندروید هم کار کنه
 	cache := tokenCache{
 		RefreshToken: b.refreshToken,
 		ClientID:     b.clientID,
@@ -151,8 +163,6 @@ func (b *GoogleBackend) Login(ctx context.Context) error {
 	}
 	cacheBytes, _ := json.MarshalIndent(cache, "", "  ")
 	os.WriteFile(tokenCachePath, cacheBytes, 0600)
-
-	fmt.Printf("OAuth OK — saved to %s\n", tokenCachePath)
 	return nil
 }
 
@@ -198,32 +208,28 @@ func (b *GoogleBackend) executeTokenRequest(ctx context.Context, v url.Values) e
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("token request: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("token %d: %s", resp.StatusCode, string(body))
 	}
-
-	var resData struct {
+	var res struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		ExpiresIn    int    `json:"expires_in"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&resData); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return err
 	}
-
-	b.token = resData.AccessToken
-	if resData.RefreshToken != "" {
-		b.refreshToken = resData.RefreshToken
+	b.token = res.AccessToken
+	if res.RefreshToken != "" {
+		b.refreshToken = res.RefreshToken
 	}
-	b.tokenEx = time.Now().Add(time.Duration(resData.ExpiresIn-60) * time.Second)
+	b.tokenEx = time.Now().Add(time.Duration(res.ExpiresIn-60) * time.Second)
 	return nil
 }
 
@@ -243,7 +249,6 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 	if err != nil {
 		return err
 	}
-
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
@@ -262,7 +267,6 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 		p2, _ := mw.CreatePart(h)
 		io.Copy(p2, data)
 	}()
-
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		"https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", pr)
 	if err != nil {
@@ -270,7 +274,6 @@ func (b *GoogleBackend) Upload(ctx context.Context, filename string, data io.Rea
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -288,25 +291,21 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 	if err != nil {
 		return nil, err
 	}
-
 	q := fmt.Sprintf("name contains '%s'", prefix)
 	if b.folderID != "" {
 		q += fmt.Sprintf(" and '%s' in parents", b.folderID)
 	}
-
 	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
 	v := u.Query()
 	v.Set("q", q)
 	v.Set("fields", "files(id, name)")
 	v.Set("pageSize", "100")
 	u.RawQuery = v.Encode()
-
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -316,7 +315,6 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("list %d: %s", resp.StatusCode, string(body))
 	}
-
 	var res struct {
 		Files []struct {
 			ID   string `json:"id"`
@@ -326,7 +324,6 @@ func (b *GoogleBackend) ListQuery(ctx context.Context, prefix string) ([]string,
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
 	}
-
 	b.fileIdsMu.Lock()
 	if len(b.fileIDs) > 1500 {
 		b.fileIDs = make(map[string]string)
@@ -349,19 +346,16 @@ func (b *GoogleBackend) Download(ctx context.Context, filename string) (io.ReadC
 	if !ok {
 		return nil, fmt.Errorf("file-id not found: %s", filename)
 	}
-
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
 		return nil, err
 	}
-
 	req, err := http.NewRequestWithContext(ctx, "GET",
 		"https://www.googleapis.com/drive/v3/files/"+fileID+"?alt=media", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -381,25 +375,21 @@ func (b *GoogleBackend) Delete(ctx context.Context, filename string) error {
 	if !ok {
 		return nil
 	}
-
 	tok, err := b.getValidToken(ctx)
 	if err != nil {
 		return err
 	}
-
 	req, err := http.NewRequestWithContext(ctx, "DELETE",
 		"https://www.googleapis.com/drive/v3/files/"+fileID, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	b.fileIdsMu.Lock()
 	delete(b.fileIDs, filename)
 	b.fileIdsMu.Unlock()
@@ -423,7 +413,6 @@ func (b *GoogleBackend) CreateFolder(ctx context.Context, name string) (string, 
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return "", err
@@ -433,9 +422,7 @@ func (b *GoogleBackend) CreateFolder(ctx context.Context, name string) (string, 
 		b2, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("create folder %d: %s", resp.StatusCode, string(b2))
 	}
-	var res struct {
-		ID string `json:"id"`
-	}
+	var res struct{ ID string `json:"id"` }
 	json.NewDecoder(resp.Body).Decode(&res)
 	b.folderID = res.ID
 	return res.ID, nil
@@ -450,27 +437,20 @@ func (b *GoogleBackend) FindFolder(ctx context.Context, name string) (string, er
 	u, _ := url.Parse("https://www.googleapis.com/drive/v3/files")
 	v := u.Query()
 	v.Set("q", q)
-	v.Set("fields", "files(id, name)")
+	v.Set("fields", "files(id)")
 	u.RawQuery = v.Encode()
-
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", nil
-	}
 	var res struct {
-		Files []struct {
-			ID string `json:"id"`
-		} `json:"files"`
+		Files []struct{ ID string `json:"id"` } `json:"files"`
 	}
 	json.NewDecoder(resp.Body).Decode(&res)
 	if len(res.Files) > 0 {

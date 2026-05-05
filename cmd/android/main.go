@@ -9,12 +9,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -30,14 +28,7 @@ var (
 	globalCancel context.CancelFunc
 	globalMu     sync.Mutex
 	running      bool
-	// callback برای ارسال لاگ به Kotlin
-	logCallback func(string)
 )
-
-func logf(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	log.Println(msg)
-}
 
 func genID() string {
 	b := make([]byte, 16)
@@ -51,12 +42,17 @@ func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, n
 	return ctx, nil, nil
 }
 
+// FIX: هر دو فایل رو جداگانه می‌گیره
+// credFileC  = مسیر credentials.json
+// tokenFileC = مسیر credentials.json.token
+//
 //export Java_com_flowdriver_service_FlowBridge_startTunnel
 func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	env uintptr,
 	obj uintptr,
 	configJsonC *C.char,
 	credFileC *C.char,
+	tokenFileC *C.char,
 ) int32 {
 	globalMu.Lock()
 	if running {
@@ -66,20 +62,24 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 
 	configJson := C.GoString(configJsonC)
 	credFile   := C.GoString(credFileC)
+	tokenFile  := C.GoString(tokenFileC)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	globalCancel = cancel
 	running = true
 	globalMu.Unlock()
 
-	err := runClient(ctx, configJson, credFile)
+	log.Printf("[INFO] credFile: %s", credFile)
+	log.Printf("[INFO] tokenFile: %s", tokenFile)
+
+	err := runClient(ctx, configJson, credFile, tokenFile)
 
 	globalMu.Lock()
 	running = false
 	globalMu.Unlock()
 
 	if err != nil {
-		logf("[ERROR] %v", err)
+		log.Printf("[ERROR] %v", err)
 		return -2
 	}
 	return 0
@@ -106,69 +106,35 @@ func Java_com_flowdriver_service_FlowBridge_flowIsRunning(env uintptr, obj uintp
 	return 0
 }
 
-func runClient(ctx context.Context, configJson, credFilePath string) error {
-	// ── ۱. بررسی فایل‌ها ─────────────────────────────────────────────────────
-	tokenPath := credFilePath + ".token"
-
-	logf("[DEBUG] credFile: %s", credFilePath)
-	logf("[DEBUG] tokenFile: %s", tokenPath)
-
-	// بررسی وجود token file
-	tokenData, err := os.ReadFile(tokenPath)
-	if err != nil {
-		return fmt.Errorf("token file not found at %s: %w", tokenPath, err)
-	}
-
-	// بررسی محتوای token
-	var tokenCheck struct {
-		RefreshToken string `json:"refresh_token"`
-		ClientID     string `json:"client_id"`
-		ClientSecret string `json:"client_secret"`
-	}
-	if err := json.Unmarshal(tokenData, &tokenCheck); err != nil {
-		return fmt.Errorf("token file invalid JSON: %w", err)
-	}
-	if tokenCheck.RefreshToken == "" {
-		return fmt.Errorf("token file missing refresh_token")
-	}
-	logf("[DEBUG] refresh_token: %s...", tokenCheck.RefreshToken[:20])
-	logf("[DEBUG] client_id present: %v", tokenCheck.ClientID != "")
-	logf("[DEBUG] client_secret present: %v", tokenCheck.ClientSecret != "")
-
-	// ── ۲. parse config ───────────────────────────────────────────────────────
+func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath string) error {
 	cfg, err := config.FromJSON(configJson)
 	if err != nil {
-		return fmt.Errorf("config parse: %w", err)
+		return fmt.Errorf("config: %w", err)
 	}
-	logf("[DEBUG] folder_id: %s", cfg.GoogleFolderID)
-	logf("[DEBUG] transport.TargetIP: %s", cfg.Transport.TargetIP)
 
-	// ── ۳. login ──────────────────────────────────────────────────────────────
 	hc := httpclient.NewCustomClient(cfg.Transport)
-	backend := storage.NewGoogleBackend(hc, credFilePath, cfg.GoogleFolderID)
 
-	logf("[INFO] Attempting login...")
+	// FIX: استفاده از NewGoogleBackendWithToken که هر دو فایل رو جداگانه می‌گیره
+	backend := storage.NewGoogleBackendWithToken(hc, credFilePath, tokenFilePath, cfg.GoogleFolderID)
+
+	log.Println("[INFO] Logging in...")
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer loginCancel()
 
 	if err := backend.Login(loginCtx); err != nil {
 		return fmt.Errorf("login: %w", err)
 	}
-	logf("[INFO] Login OK")
+	log.Println("[INFO] Login OK")
 
-	// ── ۴. folder ─────────────────────────────────────────────────────────────
 	if cfg.GoogleFolderID == "" {
-		logf("[INFO] Finding Drive folder...")
 		id, _ := backend.FindFolder(ctx, "Flow-Data")
 		if id == "" {
-			logf("[INFO] Creating Drive folder...")
 			id, _ = backend.CreateFolder(ctx, "Flow-Data")
 		}
 		cfg.GoogleFolderID = id
-		logf("[INFO] Folder ID: %s", id)
+		log.Printf("[INFO] Folder: %s", id)
 	}
 
-	// ── ۵. engine ─────────────────────────────────────────────────────────────
 	cid := cfg.ClientID
 	if cid == "" {
 		cid = genID()[:8]
@@ -183,7 +149,6 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 	}
 	engine.Start(ctx)
 
-	// ── ۶. SOCKS5 ─────────────────────────────────────────────────────────────
 	listenAddr := cfg.ListenAddr
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1080"
@@ -193,7 +158,7 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 		socks5.WithResolver(rawResolver{}),
 		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
 			sid := genID()
-			logf("[OK] session %s -> %s", sid[:8], addr)
+			log.Printf("[OK] %s -> %s", sid[:8], addr)
 			s := transport.NewSession(sid)
 			s.TargetAddr = addr
 			engine.AddSession(s)
@@ -215,17 +180,15 @@ func runClient(ctx context.Context, configJson, credFilePath string) error {
 		}),
 	)
 
-	logf("[INFO] SOCKS5 listening on %s", listenAddr)
-
+	log.Printf("[INFO] SOCKS5 on %s", listenAddr)
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.ListenAndServe("tcp", listenAddr) }()
 
 	select {
 	case <-ctx.Done():
-		logf("[INFO] stopped by context")
 		return nil
 	case err := <-srvErr:
-		return fmt.Errorf("socks5 server: %w", err)
+		return fmt.Errorf("socks5: %w", err)
 	}
 }
 

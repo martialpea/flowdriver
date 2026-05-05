@@ -24,31 +24,22 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val prefs by lazy { getSharedPreferences("flowdriver", MODE_PRIVATE) }
 
-    // FIX: فقط token picker — نه credentials.json
-    // کاربر فقط باید فایل .token رو import کنه
+    // import credentials.json
+    private val pickCredentials = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri ?: return@registerForActivityResult
+        importFile(uri, "credentials.json", validate = { content ->
+            val json = JSONObject(content)
+            if (!json.has("installed")) throw Exception("فایل credentials.json معتبر نیست")
+        }) { toast("✓ credentials.json وارد شد") }
+    }
+
+    // import credentials.json.token
     private val pickToken = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri ?: return@registerForActivityResult
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val content = contentResolver.openInputStream(uri)?.bufferedReader()?.readText()
-                    ?: throw Exception("فایل خالی است")
-
-                // FIX: validation قبل از ذخیره
-                validateTokenFile(content)
-
-                val dest = File(filesDir, "credentials.json.token")
-                dest.writeText(content)
-
-                withContext(Dispatchers.Main) {
-                    updateBadges()
-                    toast("✓ Token وارد شد")
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    toast("❌ خطا: ${e.message}")
-                }
-            }
-        }
+        importFile(uri, "credentials.json.token", validate = { content ->
+            val json = JSONObject(content)
+            if (!json.has("refresh_token")) throw Exception("فایل token معتبر نیست — refresh_token ندارد")
+        }) { toast("✓ credentials.json.token وارد شد") }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,9 +51,10 @@ class MainActivity : AppCompatActivity() {
         updateBadges()
         syncStatusUI(FlowService.isRunning)
 
+        binding.btnImportCredentials.setOnClickListener { pickCredentials.launch("application/json") }
         binding.btnImportToken.setOnClickListener { pickToken.launch("*/*") }
         binding.btnToggle.setOnClickListener { toggleTunnel() }
-        binding.btnSaveSettings.setOnClickListener { saveSettings(); toast("✓ تنظیمات ذخیره شد") }
+        binding.btnSaveSettings.setOnClickListener { saveSettings(); toast("✓ ذخیره شد") }
         binding.btnClearLog.setOnClickListener {
             binding.tvLog.text = ""
             FlowService.logLines.clear()
@@ -73,36 +65,22 @@ class MainActivity : AppCompatActivity() {
         FlowService.logLines.forEach { appendLog(it) }
     }
 
-    // ── validation ────────────────────────────────────────────────────────────
-
-    private fun validateTokenFile(content: String) {
-        // FIX: بررسی JSON معتبر بودن
-        try {
-            val json = JSONObject(content)
-            // token file باید refresh_token داشته باشه
-            if (!json.has("refresh_token")) {
-                throw Exception("این فایل credentials.json.token نیست\nفایل باید refresh_token داشته باشد")
-            }
-        } catch (e: JSONException) {
-            throw Exception("فایل JSON معتبر نیست")
-        }
-    }
-
-    // ── tunnel control ────────────────────────────────────────────────────────
-
     private fun toggleTunnel() {
         if (FlowService.isRunning) {
-            startService(Intent(this, FlowService::class.java).apply {
-                action = FlowService.ACTION_STOP
-            })
-            syncStatusUI(false)
+            startService(Intent(this, FlowService::class.java).apply { action = FlowService.ACTION_STOP })
             return
         }
 
-        // بررسی token
+        // بررسی هر دو فایل
+        val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
+
+        if (!credFile.exists()) {
+            toast("❌ ابتدا credentials.json را import کنید")
+            return
+        }
         if (!tokenFile.exists()) {
-            toast("❌ ابتدا فایل credentials.json.token را import کنید")
+            toast("❌ ابتدا credentials.json.token را import کنید")
             return
         }
 
@@ -114,21 +92,18 @@ class MainActivity : AppCompatActivity() {
             putExtra("config_json", buildConfig().toJson())
             putExtra("token_json", tokenJson)
         })
-        syncStatusUI(true)
     }
 
-    // ── config ────────────────────────────────────────────────────────────────
-
     private fun buildConfig() = AppConfig(
-        listenAddr    = "127.0.0.1:1080",
-        storageType   = "google",
+        listenAddr     = "127.0.0.1:1080",
+        storageType    = "google",
         googleFolderId = binding.etFolderId.text.toString().trim(),
-        refreshRateMs = binding.etRefreshRate.text.toString().toIntOrNull() ?: 200,
-        flushRateMs   = binding.etFlushRate.text.toString().toIntOrNull() ?: 300,
+        refreshRateMs  = binding.etRefreshRate.text.toString().toIntOrNull() ?: 200,
+        flushRateMs    = binding.etFlushRate.text.toString().toIntOrNull() ?: 300,
         transport = TransportConfig(
-            targetIP          = binding.etTargetIP.text.toString().trim(),
-            sni               = binding.etSNI.text.toString().trim(),
-            hostHeader        = binding.etHostHeader.text.toString().trim(),
+            targetIP           = binding.etTargetIP.text.toString().trim(),
+            sni                = binding.etSNI.text.toString().trim(),
+            hostHeader         = binding.etHostHeader.text.toString().trim(),
             insecureSkipVerify = binding.switchInsecure.isChecked
         )
     )
@@ -146,23 +121,43 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadSettings() {
-        binding.etFolderId.setText(prefs.getString("folder_id",   "1VBK3MfAe01Ir1Zm6NjnLFDGfqQHY9OH6"))
-        binding.etRefreshRate.setText(prefs.getInt("refresh_ms",  200).toString())
-        binding.etFlushRate.setText(prefs.getInt("flush_ms",      300).toString())
-        binding.etTargetIP.setText(prefs.getString("target_ip",   "216.239.38.120:443"))
-        binding.etSNI.setText(prefs.getString("sni",              "google.com"))
-        binding.etHostHeader.setText(prefs.getString("host_header","www.googleapis.com"))
+        binding.etFolderId.setText(prefs.getString("folder_id",    "1VBK3MfAe01Ir1Zm6NjnLFDGfqQHY9OH6"))
+        binding.etRefreshRate.setText(prefs.getInt("refresh_ms",   200).toString())
+        binding.etFlushRate.setText(prefs.getInt("flush_ms",       300).toString())
+        binding.etTargetIP.setText(prefs.getString("target_ip",    "216.239.38.120:443"))
+        binding.etSNI.setText(prefs.getString("sni",               "google.com"))
+        binding.etHostHeader.setText(prefs.getString("host_header", "www.googleapis.com"))
         binding.switchInsecure.isChecked = prefs.getBoolean("insecure", false)
     }
 
-    // ── UI helpers ────────────────────────────────────────────────────────────
+    private fun importFile(uri: Uri, destName: String, validate: (String) -> Unit, onDone: () -> Unit) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val content = contentResolver.openInputStream(uri)?.bufferedReader()?.readText()
+                    ?: throw Exception("فایل خالی است")
+                validate(content)
+                File(filesDir, destName).writeText(content)
+                withContext(Dispatchers.Main) {
+                    updateBadges()
+                    onDone()
+                }
+            } catch (e: JSONException) {
+                withContext(Dispatchers.Main) { toast("❌ JSON نامعتبر") }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { toast("❌ ${e.message}") }
+            }
+        }
+    }
 
     private fun updateBadges() {
+        val hasCred  = File(filesDir, "credentials.json").exists()
         val hasToken = File(filesDir, "credentials.json.token").exists()
+
+        binding.tvCredStatus.text = if (hasCred) "✓ وارد شده" else "✗ وارد نشده"
+        binding.tvCredStatus.setTextColor(getColor(if (hasCred) android.R.color.holo_green_dark else android.R.color.holo_red_dark))
+
         binding.tvTokenStatus.text = if (hasToken) "✓ وارد شده" else "✗ وارد نشده"
-        binding.tvTokenStatus.setTextColor(
-            getColor(if (hasToken) android.R.color.holo_green_dark else android.R.color.holo_red_dark)
-        )
+        binding.tvTokenStatus.setTextColor(getColor(if (hasToken) android.R.color.holo_green_dark else android.R.color.holo_red_dark))
     }
 
     private fun syncStatusUI(running: Boolean) {
@@ -172,6 +167,7 @@ class MainActivity : AppCompatActivity() {
         )
         binding.tvStatus.text = if (running) "🟢 متصل" else "🔴 قطع"
         binding.cardSettings.alpha = if (running) 0.5f else 1f
+        binding.btnImportCredentials.isEnabled = !running
         binding.btnImportToken.isEnabled = !running
     }
 

@@ -35,7 +35,7 @@ class FlowService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("آماده اتصال..."))
+        startForeground(NOTIF_ID, buildNotification("آماده..."))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -60,48 +60,37 @@ class FlowService : Service() {
             stopSelf(); return
         }
 
-        // FIX: ساختار فایل‌ها باید دقیقاً این باشه:
-        // filesDir/credentials.json       ← client_id و client_secret
-        // filesDir/credentials.json.token ← refresh_token
-        // Go به credFilePath = credentials.json نگاه می‌کنه
-        // و .token رو از credFilePath+".token" می‌خونه
-
+        // credentials.json — از filesDir (کاربر import کرده)
         val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
 
-        // ۱. نوشتن token
-        tokenFile.writeText(tokenJson)
-        appendLog("[INFO] Token written: ${tokenFile.absolutePath}")
-
-        // ۲. credentials.json از assets
         if (!credFile.exists()) {
-            try {
-                assets.open("credentials.json").use { it.copyTo(credFile.outputStream()) }
-                appendLog("[INFO] credentials.json loaded from assets")
-            } catch (_: Exception) {
-                // اگه credentials.json در assets نبود، یه dummy بساز
-                // چون Go فقط client_id رو از اون می‌خونه و token داریم
-                credFile.writeText("""{"installed":{"client_id":"","client_secret":"","token_uri":"https://oauth2.googleapis.com/token","redirect_uris":["http://localhost"]}}""")
-                appendLog("[WARN] credentials.json not in assets, using dummy")
-            }
+            appendLog("[ERROR] credentials.json پیدا نشد")
+            appendLog("[HINT]  لطفاً credentials.json را import کنید")
+            stopSelf(); return
         }
 
-        appendLog("[INFO] credFile: ${credFile.absolutePath}")
-        appendLog("[INFO] tokenFile exists: ${tokenFile.exists()}")
+        // نوشتن token
+        tokenFile.writeText(tokenJson)
+
+        appendLog("[INFO] cred: ${credFile.absolutePath}")
+        appendLog("[INFO] token: ${tokenFile.absolutePath}")
 
         isRunning = true
         onStatusChange?.invoke(true)
         updateNotification("در حال اتصال...")
 
-        // blocking JNI در thread جداگانه
         jniExecutor.submit {
             try {
-                appendLog("[INFO] Calling JNI startTunnel...")
-                // فقط credFile پاس می‌کنیم — Go خودش .token رو می‌خونه
-                val result = FlowBridge.startTunnel(configJson, credFile.absolutePath)
+                val result = FlowBridge.startTunnel(
+                    configJson,
+                    credFile.absolutePath,
+                    tokenFile.absolutePath
+                )
                 appendLog("[INFO] Tunnel ended: $result")
+                if (result == -2) appendLog("[HINT] Login failed — فایل‌ها را دوباره import کنید")
             } catch (e: Exception) {
-                appendLog("[ERROR] JNI: ${e.message}")
+                appendLog("[ERROR] ${e.message}")
                 Log.e("FlowService", "JNI error", e)
             } finally {
                 isRunning = false
@@ -111,21 +100,17 @@ class FlowService : Service() {
             }
         }
 
-        // نمایش وضعیت بعد از ۳ ثانیه
         scope.launch {
-            delay(3000)
+            delay(4000)
             if (isRunning) {
                 appendLog("[INFO] ✓ SOCKS5 فعال روی 127.0.0.1:1080")
-                updateNotification("✓ متصل — SOCKS5:1080")
+                updateNotification("✓ متصل")
             }
         }
     }
 
     private fun stopTunnel() {
-        appendLog("[INFO] Stopping...")
-        try { FlowBridge.flowStop() } catch (e: Exception) {
-            Log.e("FlowService", "stop error", e)
-        }
+        try { FlowBridge.flowStop() } catch (_: Exception) {}
         isRunning = false
         onStatusChange?.invoke(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -162,8 +147,7 @@ class FlowService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIF_ID, buildNotification(text))
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
     }
 
     override fun onDestroy() {
