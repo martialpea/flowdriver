@@ -35,16 +35,14 @@ var (
 	logFile      *os.File
 )
 
-// نوشتن لاگ فقط به فایل — بدون هیچ C string
 func lg(format string, args ...interface{}) {
+	if logFile == nil {
+		return
+	}
 	msg := fmt.Sprintf(format, args...)
 	ts := time.Now().Format("15:04:05")
-	line := ts + " " + msg + "\n"
-	if logFile != nil {
-		logFile.WriteString(line)
-		logFile.Sync()
-	}
-	os.Stderr.WriteString(line)
+	logFile.WriteString(ts + " " + msg + "\n")
+	logFile.Sync()
 }
 
 func genID() string {
@@ -58,10 +56,6 @@ type rawResolver struct{}
 func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
 	return ctx, nil, nil
 }
-
-// ── JNI exports ───────────────────────────────────────────────────────────────
-// FIX: هیچ C.CString برنمی‌گردونیم — فقط int
-// لاگ در فایل نوشته می‌شه، Kotlin فایل رو می‌خونه
 
 //export Java_com_flowdriver_service_FlowBridge_startTunnel
 func Java_com_flowdriver_service_FlowBridge_startTunnel(
@@ -79,11 +73,12 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	credFile   := C.GoString(credFileC)
 	tokenFile  := C.GoString(tokenFileC)
 
-	// باز کردن فایل لاگ
+	// باز کردن لاگ فایل — اول از همه
 	logPath := credFile[:strings.LastIndex(credFile, "/")] + "/fd_debug.log"
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err == nil {
 		logFile = f
+		lg("=== LOG OPENED ===")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -100,6 +95,8 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	if logFile != nil {
 		if runErr != nil {
 			lg("FATAL: %v", runErr)
+		} else {
+			lg("=== DONE OK ===")
 		}
 		logFile.Close()
 		logFile = nil
@@ -132,15 +129,12 @@ func Java_com_flowdriver_service_FlowBridge_flowIsRunning(env uintptr, obj uintp
 	return 0
 }
 
-// ── core ──────────────────────────────────────────────────────────────────────
-
 func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath string) error {
-	lg("=== FlowDriver Start ===")
+	lg("=== FlowDriver Go Start ===")
 	lg("cred: %s", credFilePath)
 	lg("token: %s", tokenFilePath)
 
 	// ۱. خواندن فایل‌ها
-	lg("[1] Reading files...")
 	credData, err := os.ReadFile(credFilePath)
 	if err != nil {
 		return fmt.Errorf("read cred: %w", err)
@@ -151,7 +145,6 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 	}
 	lg("cred=%d bytes token=%d bytes", len(credData), len(tokenData))
 
-	// parse
 	var cred struct {
 		Installed struct {
 			ClientID     string `json:"client_id"`
@@ -159,14 +152,18 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 			TokenURI     string `json:"token_uri"`
 		} `json:"installed"`
 	}
-	json.Unmarshal(credData, &cred)
+	if err := json.Unmarshal(credData, &cred); err != nil {
+		return fmt.Errorf("parse cred: %w", err)
+	}
 
 	var tc struct {
 		RefreshToken string `json:"refresh_token"`
 		ClientID     string `json:"client_id"`
 		ClientSecret string `json:"client_secret"`
 	}
-	json.Unmarshal(tokenData, &tc)
+	if err := json.Unmarshal(tokenData, &tc); err != nil {
+		return fmt.Errorf("parse token: %w", err)
+	}
 
 	if tc.ClientID != "" {
 		cred.Installed.ClientID = tc.ClientID
@@ -179,21 +176,21 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 
 	lg("client_id=%s", safe(cred.Installed.ClientID, 20))
 	lg("client_secret=%s", safe(cred.Installed.ClientSecret, 6))
-	lg("refresh_token=%s", safe(tc.RefreshToken, 25))
+	lg("refresh_token=%s", safe(tc.RefreshToken, 20))
 	lg("token_uri=%s", tokenURI)
 
 	if cred.Installed.ClientID == "" {
-		return fmt.Errorf("client_id is empty in credentials.json")
+		return fmt.Errorf("client_id is empty")
 	}
 	if cred.Installed.ClientSecret == "" {
-		return fmt.Errorf("client_secret is empty in credentials.json")
+		return fmt.Errorf("client_secret is empty")
 	}
 	if tc.RefreshToken == "" {
-		return fmt.Errorf("refresh_token is empty in token file")
+		return fmt.Errorf("refresh_token is empty")
 	}
 
 	// ۲. OAuth مستقیم
-	lg("[2] Direct OAuth request...")
+	lg("Sending OAuth request to %s", tokenURI)
 	plainClient := &http.Client{Timeout: 30 * time.Second}
 
 	v := url.Values{}
@@ -211,25 +208,26 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 
 	resp, err := plainClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("oauth http: %w", err)
+		return fmt.Errorf("oauth http error: %w", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 
-	lg("oauth status: %d", resp.StatusCode)
-	lg("oauth body: %s", string(body))
+	lg("oauth status=%d", resp.StatusCode)
+	lg("oauth body=%s", string(body))
 
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("oauth failed %d: %s", resp.StatusCode, string(body))
 	}
 	lg("OAuth OK!")
 
-	// ۳. backend
-	lg("[3] Backend login...")
+	// ۳. backend + engine
+	lg("Setting up backend...")
 	cfg, err := config.FromJSON(configJson)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
+	lg("folder=%s transport=%s", cfg.GoogleFolderID, cfg.Transport.TargetIP)
 
 	backend := storage.NewGoogleBackendWithToken(plainClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -252,8 +250,6 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		lg("folder: %s", id)
 	}
 
-	// ۴. engine
-	lg("[4] Starting engine...")
 	cid := genID()[:8]
 	engine := transport.NewEngine(driveBackend, true, cid)
 	if cfg.RefreshRateMs > 0 {
@@ -263,6 +259,7 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		engine.SetFlushRate(cfg.FlushRateMs)
 	}
 	engine.Start(ctx)
+	lg("Engine started")
 
 	listenAddr := cfg.ListenAddr
 	if listenAddr == "" {
@@ -295,13 +292,13 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		}),
 	)
 
-	lg("[5] SOCKS5 on %s — READY", listenAddr)
+	lg("SOCKS5 on %s READY", listenAddr)
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.ListenAndServe("tcp", listenAddr) }()
 
 	select {
 	case <-ctx.Done():
-		lg("stopped")
+		lg("context cancelled")
 		return nil
 	case err := <-srvErr:
 		return fmt.Errorf("socks5: %w", err)
