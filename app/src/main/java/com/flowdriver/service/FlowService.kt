@@ -64,20 +64,23 @@ class FlowService : Service() {
         val tokenFile = File(filesDir, "credentials.json.token")
 
         if (!credFile.exists()) {
-            appendLog("[ERROR] credentials.json پیدا نشد — import کنید")
+            appendLog("[ERROR] credentials.json پیدا نشد")
             stopSelf(); return
         }
 
         tokenFile.writeText(tokenJson)
+        appendLog("[INFO] Files ready")
+        appendLog("[INFO] cred: ${credFile.absolutePath}")
+        appendLog("[INFO] token: ${tokenFile.absolutePath}")
 
         isRunning = true
         onStatusChange?.invoke(true)
         updateNotification("در حال اتصال...")
 
-        // polling لاگ‌های Go هر ۵۰۰ms
+        // polling لاگ از Go هر ۳۰۰ms
         scope.launch {
             while (isRunning) {
-                delay(500)
+                delay(300)
                 try {
                     val logs = FlowBridge.getLog()
                     if (logs.isNotEmpty()) {
@@ -91,25 +94,59 @@ class FlowService : Service() {
 
         jniExecutor.submit {
             try {
+                appendLog("[INFO] Calling JNI startTunnel...")
                 val result = FlowBridge.startTunnel(
                     configJson,
                     credFile.absolutePath,
                     tokenFile.absolutePath
                 )
-                appendLog("[INFO] Tunnel ended: $result")
-                if (result == -2) {
-                    appendLog("[ERROR] Login failed")
-                    // لاگ آخر رو هم بگیر
-                    val lastLogs = FlowBridge.getLog()
-                    if (lastLogs.isNotEmpty()) {
-                        lastLogs.trim().lines().forEach { line ->
+
+                // بعد از اتمام، لاگ باقیمانده رو بگیر
+                try {
+                    val finalLogs = FlowBridge.getLog()
+                    if (finalLogs.isNotEmpty()) {
+                        finalLogs.trim().lines().forEach { line ->
                             if (line.isNotBlank()) appendLog(line)
                         }
                     }
+                } catch (_: Exception) {}
+
+                appendLog("[INFO] Tunnel result: $result")
+
+                if (result == -2) {
+                    appendLog("[ERROR] Login failed (code -2)")
+                    // خواندن لاگ فایل که persist شده
+                    try {
+                        val logPath = FlowBridge.getLogFilePath()
+                        if (logPath.isNotEmpty()) {
+                            val logFileContent = File(logPath).readText()
+                            appendLog("=== Debug Log File ===")
+                            logFileContent.lines().takeLast(50).forEach { line ->
+                                if (line.isNotBlank()) appendLog(line)
+                            }
+                            appendLog("=== End Debug Log ===")
+                        }
+                    } catch (e: Exception) {
+                        appendLog("[WARN] Cannot read log file: ${e.message}")
+                    }
                 }
+
             } catch (e: Exception) {
-                appendLog("[ERROR] JNI: ${e.message}")
+                appendLog("[ERROR] JNI exception: ${e.javaClass.simpleName}: ${e.message}")
                 Log.e("FlowService", "JNI error", e)
+
+                // حتی بعد از exception لاگ فایل رو بخون
+                try {
+                    val logPath = FlowBridge.getLogFilePath()
+                    if (logPath.isNotEmpty()) {
+                        val content = File(logPath).readText()
+                        appendLog("=== Crash Log ===")
+                        content.lines().takeLast(30).forEach { line ->
+                            if (line.isNotBlank()) appendLog(line)
+                        }
+                    }
+                } catch (_: Exception) {}
+
             } finally {
                 isRunning = false
                 onStatusChange?.invoke(false)
@@ -119,7 +156,7 @@ class FlowService : Service() {
         }
 
         scope.launch {
-            delay(5000)
+            delay(6000)
             if (isRunning) {
                 appendLog("[INFO] ✓ SOCKS5 فعال روی 127.0.0.1:1080")
                 updateNotification("✓ متصل")
@@ -141,7 +178,7 @@ class FlowService : Service() {
         val entry = "[$ts] $line"
         synchronized(logLines) {
             logLines.add(entry)
-            if (logLines.size > 300) logLines.removeAt(0)
+            if (logLines.size > 500) logLines.removeAt(0)
         }
         onLogUpdate?.invoke(entry)
     }

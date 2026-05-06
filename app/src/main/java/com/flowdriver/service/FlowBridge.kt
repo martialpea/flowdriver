@@ -18,6 +18,6 @@ object FlowBridge {
     external fun startTunnel(configJson: String, credFilePath: String, tokenFilePath: String): Int
     external fun flowStop()
     external fun flowIsRunning(): Int
-    // لاگ‌های Go رو می‌گیریم
     external fun getLog(): String
+    external fun getLogFilePath(): String
 }

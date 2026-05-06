@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,40 +28,43 @@ import (
 	"github.com/things-go/go-socks5/statute"
 )
 
-// ── log buffer ────────────────────────────────────────────────────────────────
 var (
 	globalCancel context.CancelFunc
 	globalMu     sync.Mutex
 	running      bool
+	logFile      *os.File
+	logFilePath  string
 	logBuf       []string
 	logBufMu     sync.Mutex
 )
 
-func init() {
-	log.SetOutput(&logWriter{})
-	log.SetFlags(log.Ltime | log.Lshortfile)
-}
+// اضافه لاگ به فایل و buffer همزمان
+func lg(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	ts := time.Now().Format("15:04:05")
+	line := fmt.Sprintf("[%s] %s", ts, msg)
 
-type logWriter struct{}
-
-func (w *logWriter) Write(p []byte) (int, error) {
-	msg := strings.TrimRight(string(p), "\n")
 	logBufMu.Lock()
-	logBuf = append(logBuf, msg)
-	if len(logBuf) > 1000 {
-		logBuf = logBuf[len(logBuf)-1000:]
+	logBuf = append(logBuf, line)
+	if len(logBuf) > 2000 {
+		logBuf = logBuf[len(logBuf)-2000:]
 	}
 	logBufMu.Unlock()
-	os.Stderr.Write(p)
-	return len(p), nil
+
+	// نوشتن به فایل — persist می‌شه حتی بعد از crash
+	if logFile != nil {
+		logFile.WriteString(line + "\n")
+		logFile.Sync()
+	}
+	os.Stderr.WriteString(line + "\n")
 }
 
-func appendLog(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	logBufMu.Lock()
-	logBuf = append(logBuf, msg)
-	logBufMu.Unlock()
-	os.Stderr.WriteString(msg + "\n")
+func initLog(filesDir string) {
+	logFilePath = filesDir + "/flowdriver_debug.log"
+	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err == nil {
+		logFile = f
+	}
 }
 
 func genID() string {
@@ -94,6 +96,11 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	configJson := C.GoString(configJsonC)
 	credFile   := C.GoString(credFileC)
 	tokenFile  := C.GoString(tokenFileC)
+
+	// init log در همون دایرکتوری فایل‌ها
+	dir := credFile[:strings.LastIndex(credFile, "/")]
+	initLog(dir)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	globalCancel = cancel
 	running = true
@@ -105,8 +112,12 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	running = false
 	globalMu.Unlock()
 
+	if logFile != nil {
+		logFile.Close()
+	}
+
 	if err != nil {
-		appendLog("[FATAL] %v", err)
+		lg("[FATAL] %v", err)
 		return -2
 	}
 	return 0
@@ -145,72 +156,126 @@ func Java_com_flowdriver_service_FlowBridge_getLog(env uintptr, obj uintptr) *C.
 	return C.CString(result)
 }
 
+// getLogFile: مسیر فایل لاگ رو برمی‌گردونه — Kotlin می‌تونه بعد از crash بخوندش
+//
+//export Java_com_flowdriver_service_FlowBridge_getLogFilePath
+func Java_com_flowdriver_service_FlowBridge_getLogFilePath(env uintptr, obj uintptr) *C.char {
+	return C.CString(logFilePath)
+}
+
 // ── core ──────────────────────────────────────────────────────────────────────
 
 func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath string) error {
+	lg("========== FlowDriver Start ==========")
+	lg("credFile: %s", credFilePath)
+	lg("tokenFile: %s", tokenFilePath)
 
 	// ── ۱. بررسی فایل‌ها ─────────────────────────────────────────────────────
-	appendLog("[STEP1] Checking files...")
-
+	lg("[1] Reading credentials.json...")
 	credData, err := os.ReadFile(credFilePath)
 	if err != nil {
-		return fmt.Errorf("cannot read credentials.json: %w", err)
+		return fmt.Errorf("read credentials.json: %w", err)
 	}
-	appendLog("[FILE] credentials.json: %d bytes", len(credData))
+	lg("    size=%d bytes", len(credData))
 
+	var cred struct {
+		Installed struct {
+			ClientID     string `json:"client_id"`
+			ClientSecret string `json:"client_secret"`
+			TokenURI     string `json:"token_uri"`
+		} `json:"installed"`
+	}
+	if err := json.Unmarshal(credData, &cred); err != nil {
+		return fmt.Errorf("parse credentials.json: %w", err)
+	}
+	lg("    client_id=%s", safe(cred.Installed.ClientID, 20))
+	lg("    client_secret=%s", safe(cred.Installed.ClientSecret, 6))
+
+	lg("[2] Reading token file...")
 	tokenData, err := os.ReadFile(tokenFilePath)
 	if err != nil {
-		return fmt.Errorf("cannot read token file: %w", err)
+		return fmt.Errorf("read token file: %w", err)
 	}
-	appendLog("[FILE] token file: %d bytes", len(tokenData))
+	lg("    size=%d bytes", len(tokenData))
 
-	// بررسی محتوای token
-	var tokenCheck map[string]interface{}
-	if err := json.Unmarshal(tokenData, &tokenCheck); err != nil {
-		return fmt.Errorf("token file invalid JSON: %w", err)
+	var tc struct {
+		RefreshToken string `json:"refresh_token"`
+		ClientID     string `json:"client_id"`
+		ClientSecret string `json:"client_secret"`
 	}
-	appendLog("[FILE] token keys: %v", keys(tokenCheck))
-
-	// بررسی محتوای credentials
-	var credCheck map[string]interface{}
-	if err := json.Unmarshal(credData, &credCheck); err != nil {
-		return fmt.Errorf("credentials.json invalid JSON: %w", err)
+	if err := json.Unmarshal(tokenData, &tc); err != nil {
+		return fmt.Errorf("parse token file: %w", err)
 	}
-	appendLog("[FILE] cred keys: %v", keys(credCheck))
+	lg("    refresh_token=%s", safe(tc.RefreshToken, 25))
+	if tc.ClientID != "" {
+		lg("    has embedded client_id=YES")
+		cred.Installed.ClientID = tc.ClientID
+		cred.Installed.ClientSecret = tc.ClientSecret
+	} else {
+		lg("    has embedded client_id=NO (using credentials.json)")
+	}
 
-	// ── ۲. parse config ───────────────────────────────────────────────────────
-	appendLog("[STEP2] Parsing config...")
+	tokenURI := cred.Installed.TokenURI
+	if tokenURI == "" {
+		tokenURI = "https://oauth2.googleapis.com/token"
+	}
+
+	// ── ۳. مستقیم OAuth تست کن ───────────────────────────────────────────────
+	lg("[3] Direct OAuth test to: %s", tokenURI)
+
+	plainClient := &http.Client{Timeout: 30 * time.Second}
+
+	v := url.Values{}
+	v.Set("grant_type", "refresh_token")
+	v.Set("refresh_token", tc.RefreshToken)
+	v.Set("client_id", cred.Installed.ClientID)
+	v.Set("client_secret", cred.Installed.ClientSecret)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenURI, strings.NewReader(v.Encode()))
+	if err != nil {
+		return fmt.Errorf("create oauth request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	lg("    Sending request...")
+	resp, err := plainClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("oauth http error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	lg("    Status: %d", resp.StatusCode)
+	lg("    Body: %s", string(body))
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("oauth failed %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	json.Unmarshal(body, &tokenResp)
+	lg("    access_token=%s (expires_in=%d)", safe(tokenResp.AccessToken, 10), tokenResp.ExpiresIn)
+
+	// ── ۴. storage backend ────────────────────────────────────────────────────
+	lg("[4] Setting up storage backend...")
 	cfg, err := config.FromJSON(configJson)
 	if err != nil {
 		return fmt.Errorf("config parse: %w", err)
 	}
-	appendLog("[CFG] folder=%s refresh=%d flush=%d transport=%s",
-		cfg.GoogleFolderID, cfg.RefreshRateMs, cfg.FlushRateMs, cfg.Transport.TargetIP)
+	lg("    folder=%s transport=%s", cfg.GoogleFolderID, cfg.Transport.TargetIP)
 
-	// ── ۳. تست مستقیم OAuth ───────────────────────────────────────────────────
-	appendLog("[STEP3] Testing OAuth directly (no DPI bypass)...")
-
-	plainClient := &http.Client{Timeout: 30 * time.Second}
-	oauthErr := testOAuth(plainClient, credFilePath, tokenFilePath)
-	if oauthErr != nil {
-		return fmt.Errorf("OAuth test failed: %w", oauthErr)
-	}
-	appendLog("[OAUTH] OK!")
-
-	// ── ۴. login با storage backend ───────────────────────────────────────────
-	appendLog("[STEP4] Login via storage backend...")
 	backend := storage.NewGoogleBackendWithToken(plainClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
-
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer loginCancel()
 
 	if err := backend.Login(loginCtx); err != nil {
 		return fmt.Errorf("backend login: %w", err)
 	}
-	appendLog("[LOGIN] Backend login OK")
+	lg("    backend login OK")
 
-	// ── ۵. Drive API ──────────────────────────────────────────────────────────
-	appendLog("[STEP5] Setting up Drive backend...")
 	customClient := httpclient.NewCustomClient(cfg.Transport)
 	driveBackend := storage.NewGoogleBackendWithToken(customClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
 	driveBackend.CopyTokenFrom(backend)
@@ -221,16 +286,12 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 			id, _ = driveBackend.CreateFolder(ctx, "Flow-Data")
 		}
 		cfg.GoogleFolderID = id
-		appendLog("[DRIVE] folder: %s", id)
+		lg("    folder found/created: %s", id)
 	}
 
-	// ── ۶. engine ─────────────────────────────────────────────────────────────
-	appendLog("[STEP6] Starting engine...")
-	cid := cfg.ClientID
-	if cid == "" {
-		cid = genID()[:8]
-	}
-
+	// ── ۵. engine + SOCKS5 ────────────────────────────────────────────────────
+	lg("[5] Starting engine...")
+	cid := genID()[:8]
 	engine := transport.NewEngine(driveBackend, true, cid)
 	if cfg.RefreshRateMs > 0 {
 		engine.SetPollRate(cfg.RefreshRateMs)
@@ -240,7 +301,6 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 	}
 	engine.Start(ctx)
 
-	// ── ۷. SOCKS5 ─────────────────────────────────────────────────────────────
 	listenAddr := cfg.ListenAddr
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:1080"
@@ -250,7 +310,7 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		socks5.WithResolver(rawResolver{}),
 		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
 			sid := genID()
-			appendLog("[SOCKS] %s -> %s", sid[:8], addr)
+			lg("[SOCKS] %s -> %s", sid[:8], addr)
 			s := transport.NewSession(sid)
 			s.TargetAddr = addr
 			engine.AddSession(s)
@@ -272,113 +332,23 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		}),
 	)
 
-	appendLog("[STEP7] SOCKS5 listening on %s", listenAddr)
+	lg("[6] SOCKS5 on %s — READY", listenAddr)
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.ListenAndServe("tcp", listenAddr) }()
 
 	select {
 	case <-ctx.Done():
-		appendLog("[INFO] stopped")
+		lg("[INFO] stopped by context")
 		return nil
 	case err := <-srvErr:
 		return fmt.Errorf("socks5: %w", err)
 	}
 }
 
-// testOAuth: مستقیم OAuth رو تست می‌کنه بدون storage backend
-func testOAuth(client *http.Client, credFilePath, tokenFilePath string) error {
-	// خواندن client_id و client_secret
-	var clientID, clientSecret, tokenURI string
-	if data, err := os.ReadFile(credFilePath); err == nil {
-		var cred struct {
-			Installed struct {
-				ClientID     string `json:"client_id"`
-				ClientSecret string `json:"client_secret"`
-				TokenURI     string `json:"token_uri"`
-			} `json:"installed"`
-		}
-		if json.Unmarshal(data, &cred) == nil {
-			clientID = cred.Installed.ClientID
-			clientSecret = cred.Installed.ClientSecret
-			tokenURI = cred.Installed.TokenURI
-		}
+func safe(s string, n int) string {
+	if s == "" {
+		return "(empty)"
 	}
-
-	// خواندن refresh_token
-	var refreshToken string
-	if data, err := os.ReadFile(tokenFilePath); err == nil {
-		var tc struct {
-			RefreshToken string `json:"refresh_token"`
-			ClientID     string `json:"client_id"`
-			ClientSecret string `json:"client_secret"`
-		}
-		if json.Unmarshal(data, &tc) == nil {
-			refreshToken = tc.RefreshToken
-			if tc.ClientID != "" {
-				clientID = tc.ClientID
-				clientSecret = tc.ClientSecret
-			}
-		}
-	}
-
-	if tokenURI == "" {
-		tokenURI = "https://oauth2.googleapis.com/token"
-	}
-
-	appendLog("[OAUTH] client_id=%s", safeStr(clientID, 20))
-	appendLog("[OAUTH] client_secret=%s", safeStr(clientSecret, 8))
-	appendLog("[OAUTH] refresh_token=%s", safeStr(refreshToken, 25))
-	appendLog("[OAUTH] token_uri=%s", tokenURI)
-
-	if clientID == "" {
-		return fmt.Errorf("client_id is empty")
-	}
-	if clientSecret == "" {
-		return fmt.Errorf("client_secret is empty")
-	}
-	if refreshToken == "" {
-		return fmt.Errorf("refresh_token is empty")
-	}
-
-	v := url.Values{}
-	v.Set("grant_type", "refresh_token")
-	v.Set("refresh_token", refreshToken)
-	v.Set("client_id", clientID)
-	v.Set("client_secret", clientSecret)
-
-	appendLog("[OAUTH] Sending token request to %s...", tokenURI)
-
-	req, err := http.NewRequest("POST", tokenURI, strings.NewReader(v.Encode()))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	appendLog("[OAUTH] Response status: %d", resp.StatusCode)
-	appendLog("[OAUTH] Response body: %s", string(body))
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("token refresh failed %d: %s", resp.StatusCode, string(body))
-	}
-	return nil
-}
-
-func keys(m map[string]interface{}) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
-}
-
-func safeStr(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
