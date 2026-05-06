@@ -33,38 +33,18 @@ var (
 	globalMu     sync.Mutex
 	running      bool
 	logFile      *os.File
-	logFilePath  string
-	logBuf       []string
-	logBufMu     sync.Mutex
 )
 
-// اضافه لاگ به فایل و buffer همزمان
+// نوشتن لاگ فقط به فایل — بدون هیچ C string
 func lg(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	ts := time.Now().Format("15:04:05")
-	line := fmt.Sprintf("[%s] %s", ts, msg)
-
-	logBufMu.Lock()
-	logBuf = append(logBuf, line)
-	if len(logBuf) > 2000 {
-		logBuf = logBuf[len(logBuf)-2000:]
-	}
-	logBufMu.Unlock()
-
-	// نوشتن به فایل — persist می‌شه حتی بعد از crash
+	line := ts + " " + msg + "\n"
 	if logFile != nil {
-		logFile.WriteString(line + "\n")
+		logFile.WriteString(line)
 		logFile.Sync()
 	}
-	os.Stderr.WriteString(line + "\n")
-}
-
-func initLog(filesDir string) {
-	logFilePath = filesDir + "/flowdriver_debug.log"
-	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err == nil {
-		logFile = f
-	}
+	os.Stderr.WriteString(line)
 }
 
 func genID() string {
@@ -80,6 +60,8 @@ func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, n
 }
 
 // ── JNI exports ───────────────────────────────────────────────────────────────
+// FIX: هیچ C.CString برنمی‌گردونیم — فقط int
+// لاگ در فایل نوشته می‌شه، Kotlin فایل رو می‌خونه
 
 //export Java_com_flowdriver_service_FlowBridge_startTunnel
 func Java_com_flowdriver_service_FlowBridge_startTunnel(
@@ -97,27 +79,33 @@ func Java_com_flowdriver_service_FlowBridge_startTunnel(
 	credFile   := C.GoString(credFileC)
 	tokenFile  := C.GoString(tokenFileC)
 
-	// init log در همون دایرکتوری فایل‌ها
-	dir := credFile[:strings.LastIndex(credFile, "/")]
-	initLog(dir)
+	// باز کردن فایل لاگ
+	logPath := credFile[:strings.LastIndex(credFile, "/")] + "/fd_debug.log"
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err == nil {
+		logFile = f
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	globalCancel = cancel
 	running = true
 	globalMu.Unlock()
 
-	err := runClient(ctx, configJson, credFile, tokenFile)
+	runErr := runClient(ctx, configJson, credFile, tokenFile)
 
 	globalMu.Lock()
 	running = false
 	globalMu.Unlock()
 
 	if logFile != nil {
+		if runErr != nil {
+			lg("FATAL: %v", runErr)
+		}
 		logFile.Close()
+		logFile = nil
 	}
 
-	if err != nil {
-		lg("[FATAL] %v", err)
+	if runErr != nil {
 		return -2
 	}
 	return 0
@@ -144,40 +132,26 @@ func Java_com_flowdriver_service_FlowBridge_flowIsRunning(env uintptr, obj uintp
 	return 0
 }
 
-//export Java_com_flowdriver_service_FlowBridge_getLog
-func Java_com_flowdriver_service_FlowBridge_getLog(env uintptr, obj uintptr) *C.char {
-	logBufMu.Lock()
-	defer logBufMu.Unlock()
-	if len(logBuf) == 0 {
-		return C.CString("")
-	}
-	result := strings.Join(logBuf, "\n")
-	logBuf = nil
-	return C.CString(result)
-}
-
-// getLogFile: مسیر فایل لاگ رو برمی‌گردونه — Kotlin می‌تونه بعد از crash بخوندش
-//
-//export Java_com_flowdriver_service_FlowBridge_getLogFilePath
-func Java_com_flowdriver_service_FlowBridge_getLogFilePath(env uintptr, obj uintptr) *C.char {
-	return C.CString(logFilePath)
-}
-
 // ── core ──────────────────────────────────────────────────────────────────────
 
 func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath string) error {
-	lg("========== FlowDriver Start ==========")
-	lg("credFile: %s", credFilePath)
-	lg("tokenFile: %s", tokenFilePath)
+	lg("=== FlowDriver Start ===")
+	lg("cred: %s", credFilePath)
+	lg("token: %s", tokenFilePath)
 
-	// ── ۱. بررسی فایل‌ها ─────────────────────────────────────────────────────
-	lg("[1] Reading credentials.json...")
+	// ۱. خواندن فایل‌ها
+	lg("[1] Reading files...")
 	credData, err := os.ReadFile(credFilePath)
 	if err != nil {
-		return fmt.Errorf("read credentials.json: %w", err)
+		return fmt.Errorf("read cred: %w", err)
 	}
-	lg("    size=%d bytes", len(credData))
+	tokenData, err := os.ReadFile(tokenFilePath)
+	if err != nil {
+		return fmt.Errorf("read token: %w", err)
+	}
+	lg("cred=%d bytes token=%d bytes", len(credData), len(tokenData))
 
+	// parse
 	var cred struct {
 		Installed struct {
 			ClientID     string `json:"client_id"`
@@ -185,44 +159,41 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 			TokenURI     string `json:"token_uri"`
 		} `json:"installed"`
 	}
-	if err := json.Unmarshal(credData, &cred); err != nil {
-		return fmt.Errorf("parse credentials.json: %w", err)
-	}
-	lg("    client_id=%s", safe(cred.Installed.ClientID, 20))
-	lg("    client_secret=%s", safe(cred.Installed.ClientSecret, 6))
-
-	lg("[2] Reading token file...")
-	tokenData, err := os.ReadFile(tokenFilePath)
-	if err != nil {
-		return fmt.Errorf("read token file: %w", err)
-	}
-	lg("    size=%d bytes", len(tokenData))
+	json.Unmarshal(credData, &cred)
 
 	var tc struct {
 		RefreshToken string `json:"refresh_token"`
 		ClientID     string `json:"client_id"`
 		ClientSecret string `json:"client_secret"`
 	}
-	if err := json.Unmarshal(tokenData, &tc); err != nil {
-		return fmt.Errorf("parse token file: %w", err)
-	}
-	lg("    refresh_token=%s", safe(tc.RefreshToken, 25))
+	json.Unmarshal(tokenData, &tc)
+
 	if tc.ClientID != "" {
-		lg("    has embedded client_id=YES")
 		cred.Installed.ClientID = tc.ClientID
 		cred.Installed.ClientSecret = tc.ClientSecret
-	} else {
-		lg("    has embedded client_id=NO (using credentials.json)")
 	}
-
 	tokenURI := cred.Installed.TokenURI
 	if tokenURI == "" {
 		tokenURI = "https://oauth2.googleapis.com/token"
 	}
 
-	// ── ۳. مستقیم OAuth تست کن ───────────────────────────────────────────────
-	lg("[3] Direct OAuth test to: %s", tokenURI)
+	lg("client_id=%s", safe(cred.Installed.ClientID, 20))
+	lg("client_secret=%s", safe(cred.Installed.ClientSecret, 6))
+	lg("refresh_token=%s", safe(tc.RefreshToken, 25))
+	lg("token_uri=%s", tokenURI)
 
+	if cred.Installed.ClientID == "" {
+		return fmt.Errorf("client_id is empty in credentials.json")
+	}
+	if cred.Installed.ClientSecret == "" {
+		return fmt.Errorf("client_secret is empty in credentials.json")
+	}
+	if tc.RefreshToken == "" {
+		return fmt.Errorf("refresh_token is empty in token file")
+	}
+
+	// ۲. OAuth مستقیم
+	lg("[2] Direct OAuth request...")
 	plainClient := &http.Client{Timeout: 30 * time.Second}
 
 	v := url.Values{}
@@ -231,50 +202,42 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 	v.Set("client_id", cred.Installed.ClientID)
 	v.Set("client_secret", cred.Installed.ClientSecret)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", tokenURI, strings.NewReader(v.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenURI,
+		strings.NewReader(v.Encode()))
 	if err != nil {
-		return fmt.Errorf("create oauth request: %w", err)
+		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	lg("    Sending request...")
 	resp, err := plainClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("oauth http error: %w", err)
+		return fmt.Errorf("oauth http: %w", err)
 	}
-	defer resp.Body.Close()
-
 	body, _ := io.ReadAll(resp.Body)
-	lg("    Status: %d", resp.StatusCode)
-	lg("    Body: %s", string(body))
+	resp.Body.Close()
+
+	lg("oauth status: %d", resp.StatusCode)
+	lg("oauth body: %s", string(body))
 
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("oauth failed %d: %s", resp.StatusCode, string(body))
 	}
+	lg("OAuth OK!")
 
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	json.Unmarshal(body, &tokenResp)
-	lg("    access_token=%s (expires_in=%d)", safe(tokenResp.AccessToken, 10), tokenResp.ExpiresIn)
-
-	// ── ۴. storage backend ────────────────────────────────────────────────────
-	lg("[4] Setting up storage backend...")
+	// ۳. backend
+	lg("[3] Backend login...")
 	cfg, err := config.FromJSON(configJson)
 	if err != nil {
-		return fmt.Errorf("config parse: %w", err)
+		return fmt.Errorf("config: %w", err)
 	}
-	lg("    folder=%s transport=%s", cfg.GoogleFolderID, cfg.Transport.TargetIP)
 
 	backend := storage.NewGoogleBackendWithToken(plainClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
 	loginCtx, loginCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer loginCancel()
-
 	if err := backend.Login(loginCtx); err != nil {
 		return fmt.Errorf("backend login: %w", err)
 	}
-	lg("    backend login OK")
+	lg("Backend login OK")
 
 	customClient := httpclient.NewCustomClient(cfg.Transport)
 	driveBackend := storage.NewGoogleBackendWithToken(customClient, credFilePath, tokenFilePath, cfg.GoogleFolderID)
@@ -286,11 +249,11 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 			id, _ = driveBackend.CreateFolder(ctx, "Flow-Data")
 		}
 		cfg.GoogleFolderID = id
-		lg("    folder found/created: %s", id)
+		lg("folder: %s", id)
 	}
 
-	// ── ۵. engine + SOCKS5 ────────────────────────────────────────────────────
-	lg("[5] Starting engine...")
+	// ۴. engine
+	lg("[4] Starting engine...")
 	cid := genID()[:8]
 	engine := transport.NewEngine(driveBackend, true, cid)
 	if cfg.RefreshRateMs > 0 {
@@ -310,7 +273,7 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		socks5.WithResolver(rawResolver{}),
 		socks5.WithDial(func(dc context.Context, network, addr string) (net.Conn, error) {
 			sid := genID()
-			lg("[SOCKS] %s -> %s", sid[:8], addr)
+			lg("SOCKS %s->%s", sid[:6], addr)
 			s := transport.NewSession(sid)
 			s.TargetAddr = addr
 			engine.AddSession(s)
@@ -332,13 +295,13 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		}),
 	)
 
-	lg("[6] SOCKS5 on %s — READY", listenAddr)
+	lg("[5] SOCKS5 on %s — READY", listenAddr)
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- srv.ListenAndServe("tcp", listenAddr) }()
 
 	select {
 	case <-ctx.Done():
-		lg("[INFO] stopped by context")
+		lg("stopped")
 		return nil
 	case err := <-srvErr:
 		return fmt.Errorf("socks5: %w", err)

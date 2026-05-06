@@ -62,6 +62,8 @@ class FlowService : Service() {
 
         val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
+        // FIX: لاگ فایل در همون دایرکتوری — Go اینجا می‌نویسه
+        val debugLog  = File(filesDir, "fd_debug.log")
 
         if (!credFile.exists()) {
             appendLog("[ERROR] credentials.json پیدا نشد")
@@ -69,84 +71,69 @@ class FlowService : Service() {
         }
 
         tokenFile.writeText(tokenJson)
-        appendLog("[INFO] Files ready")
-        appendLog("[INFO] cred: ${credFile.absolutePath}")
-        appendLog("[INFO] token: ${tokenFile.absolutePath}")
+        // پاک کردن لاگ قبلی
+        debugLog.delete()
+
+        appendLog("[INFO] Starting JNI tunnel...")
+        appendLog("[INFO] Log file: ${debugLog.absolutePath}")
 
         isRunning = true
         onStatusChange?.invoke(true)
         updateNotification("در حال اتصال...")
 
-        // polling لاگ از Go هر ۳۰۰ms
+        // polling فایل لاگ هر ۵۰۰ms
         scope.launch {
+            var lastSize = 0L
             while (isRunning) {
-                delay(300)
+                delay(500)
                 try {
-                    val logs = FlowBridge.getLog()
-                    if (logs.isNotEmpty()) {
-                        logs.trim().lines().forEach { line ->
-                            if (line.isNotBlank()) appendLog(line)
+                    if (debugLog.exists()) {
+                        val currentSize = debugLog.length()
+                        if (currentSize > lastSize) {
+                            val content = debugLog.readText()
+                            val lines = content.lines()
+                            val newLines = if (lastSize == 0L) {
+                                lines
+                            } else {
+                                // فقط خطوط جدید
+                                val prevLines = content.substring(0, lastSize.toInt().coerceAtMost(content.length)).lines().size
+                                lines.drop(prevLines.coerceAtLeast(0))
+                            }
+                            newLines.forEach { line ->
+                                if (line.isNotBlank()) appendLog(line)
+                            }
+                            lastSize = currentSize
                         }
                     }
                 } catch (_: Exception) {}
             }
+
+            // خواندن آخرین لاگ بعد از اتمام
+            delay(500)
+            try {
+                if (debugLog.exists()) {
+                    val content = debugLog.readText()
+                    appendLog("=== Final Debug Log ===")
+                    content.lines().forEach { line ->
+                        if (line.isNotBlank()) appendLog(line)
+                    }
+                }
+            } catch (_: Exception) {}
         }
 
         jniExecutor.submit {
             try {
-                appendLog("[INFO] Calling JNI startTunnel...")
                 val result = FlowBridge.startTunnel(
                     configJson,
                     credFile.absolutePath,
                     tokenFile.absolutePath
                 )
-
-                // بعد از اتمام، لاگ باقیمانده رو بگیر
-                try {
-                    val finalLogs = FlowBridge.getLog()
-                    if (finalLogs.isNotEmpty()) {
-                        finalLogs.trim().lines().forEach { line ->
-                            if (line.isNotBlank()) appendLog(line)
-                        }
-                    }
-                } catch (_: Exception) {}
-
+                // صبر می‌کنیم تا polling آخرین لاگ رو بخونه
+                Thread.sleep(1000)
                 appendLog("[INFO] Tunnel result: $result")
-
-                if (result == -2) {
-                    appendLog("[ERROR] Login failed (code -2)")
-                    // خواندن لاگ فایل که persist شده
-                    try {
-                        val logPath = FlowBridge.getLogFilePath()
-                        if (logPath.isNotEmpty()) {
-                            val logFileContent = File(logPath).readText()
-                            appendLog("=== Debug Log File ===")
-                            logFileContent.lines().takeLast(50).forEach { line ->
-                                if (line.isNotBlank()) appendLog(line)
-                            }
-                            appendLog("=== End Debug Log ===")
-                        }
-                    } catch (e: Exception) {
-                        appendLog("[WARN] Cannot read log file: ${e.message}")
-                    }
-                }
-
             } catch (e: Exception) {
-                appendLog("[ERROR] JNI exception: ${e.javaClass.simpleName}: ${e.message}")
+                appendLog("[ERROR] JNI: ${e.message}")
                 Log.e("FlowService", "JNI error", e)
-
-                // حتی بعد از exception لاگ فایل رو بخون
-                try {
-                    val logPath = FlowBridge.getLogFilePath()
-                    if (logPath.isNotEmpty()) {
-                        val content = File(logPath).readText()
-                        appendLog("=== Crash Log ===")
-                        content.lines().takeLast(30).forEach { line ->
-                            if (line.isNotBlank()) appendLog(line)
-                        }
-                    }
-                } catch (_: Exception) {}
-
             } finally {
                 isRunning = false
                 onStatusChange?.invoke(false)
