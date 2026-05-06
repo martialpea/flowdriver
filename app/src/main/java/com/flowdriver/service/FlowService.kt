@@ -36,17 +36,20 @@ class FlowService : Service() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("آماده..."))
+        appendLog("[Kotlin] Service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        appendLog("[Kotlin] onStartCommand: ${intent?.action}")
         when (intent?.action) {
             ACTION_START -> {
                 val configJson = intent.getStringExtra("config_json") ?: run {
-                    appendLog("[ERROR] No config"); stopSelf(); return START_NOT_STICKY
+                    appendLog("[ERROR] No config_json"); stopSelf(); return START_NOT_STICKY
                 }
                 val tokenJson = intent.getStringExtra("token_json") ?: run {
-                    appendLog("[ERROR] No token"); stopSelf(); return START_NOT_STICKY
+                    appendLog("[ERROR] No token_json"); stopSelf(); return START_NOT_STICKY
                 }
+                appendLog("[Kotlin] Got config and token, starting tunnel...")
                 startTunnel(configJson, tokenJson)
             }
             ACTION_STOP -> stopTunnel()
@@ -55,86 +58,102 @@ class FlowService : Service() {
     }
 
     private fun startTunnel(configJson: String, tokenJson: String) {
+        // ── مرحله ۱: بررسی library ───────────────────────────────────────────
+        appendLog("[Kotlin] Step 1: Loading JNI library...")
         if (!FlowBridge.load()) {
-            appendLog("[ERROR] Cannot load libflowdriver.so")
-            stopSelf(); return
+            appendLog("[ERROR] Cannot load libflowdriver.so — APK must be built with GitHub Actions")
+            isRunning = false
+            onStatusChange?.invoke(false)
+            stopSelf()
+            return
         }
+        appendLog("[Kotlin] Library loaded OK")
 
+        // ── مرحله ۲: نوشتن فایل‌ها ───────────────────────────────────────────
+        appendLog("[Kotlin] Step 2: Writing files...")
         val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
-        // FIX: لاگ فایل در همون دایرکتوری — Go اینجا می‌نویسه
         val debugLog  = File(filesDir, "fd_debug.log")
 
         if (!credFile.exists()) {
-            appendLog("[ERROR] credentials.json پیدا نشد")
+            appendLog("[ERROR] credentials.json not found in ${filesDir.absolutePath}")
+            stopSelf(); return
+        }
+        appendLog("[Kotlin] credFile exists: ${credFile.length()} bytes")
+
+        try {
+            tokenFile.writeText(tokenJson)
+            appendLog("[Kotlin] tokenFile written: ${tokenFile.length()} bytes")
+        } catch (e: Exception) {
+            appendLog("[ERROR] Cannot write token file: ${e.message}")
             stopSelf(); return
         }
 
-        tokenFile.writeText(tokenJson)
-        // پاک کردن لاگ قبلی
         debugLog.delete()
+        appendLog("[Kotlin] debug log cleared")
 
-        appendLog("[INFO] Starting JNI tunnel...")
-        appendLog("[INFO] Log file: ${debugLog.absolutePath}")
-
+        // ── مرحله ۳: شروع tunnel ─────────────────────────────────────────────
         isRunning = true
         onStatusChange?.invoke(true)
         updateNotification("در حال اتصال...")
 
-        // polling فایل لاگ هر ۵۰۰ms
+        // polling فایل لاگ
         scope.launch {
             var lastSize = 0L
             while (isRunning) {
-                delay(500)
+                delay(400)
                 try {
-                    if (debugLog.exists()) {
-                        val currentSize = debugLog.length()
-                        if (currentSize > lastSize) {
-                            val content = debugLog.readText()
-                            val lines = content.lines()
-                            val newLines = if (lastSize == 0L) {
-                                lines
-                            } else {
-                                // فقط خطوط جدید
-                                val prevLines = content.substring(0, lastSize.toInt().coerceAtMost(content.length)).lines().size
-                                lines.drop(prevLines.coerceAtLeast(0))
-                            }
-                            newLines.forEach { line ->
-                                if (line.isNotBlank()) appendLog(line)
-                            }
-                            lastSize = currentSize
+                    if (debugLog.exists() && debugLog.length() > lastSize) {
+                        val newContent = debugLog.readText()
+                        val newLines = newContent.lines()
+                        val alreadyShown = if (lastSize == 0L) 0
+                            else newContent.substring(0, lastSize.toInt().coerceAtMost(newContent.length - 1))
+                                .count { it == '\n' }
+                        newLines.drop(alreadyShown).forEach { line ->
+                            if (line.isNotBlank()) appendLog("[Go] $line")
                         }
+                        lastSize = debugLog.length()
                     }
                 } catch (_: Exception) {}
             }
-
-            // خواندن آخرین لاگ بعد از اتمام
-            delay(500)
+            // بعد از اتمام، بقیه لاگ رو بخون
+            delay(600)
             try {
                 if (debugLog.exists()) {
-                    val content = debugLog.readText()
-                    appendLog("=== Final Debug Log ===")
-                    content.lines().forEach { line ->
-                        if (line.isNotBlank()) appendLog(line)
+                    debugLog.readText().lines().forEach { line ->
+                        if (line.isNotBlank()) appendLog("[Go-final] $line")
                     }
                 }
             } catch (_: Exception) {}
         }
 
         jniExecutor.submit {
+            appendLog("[Kotlin] Step 3: Calling JNI startTunnel...")
+            appendLog("[Kotlin] credFile: ${credFile.absolutePath}")
+            appendLog("[Kotlin] tokenFile: ${tokenFile.absolutePath}")
+
             try {
                 val result = FlowBridge.startTunnel(
                     configJson,
                     credFile.absolutePath,
                     tokenFile.absolutePath
                 )
-                // صبر می‌کنیم تا polling آخرین لاگ رو بخونه
-                Thread.sleep(1000)
-                appendLog("[INFO] Tunnel result: $result")
+                Thread.sleep(800)
+                appendLog("[Kotlin] startTunnel returned: $result")
+                if (result == -2) {
+                    appendLog("[ERROR] Login failed (code -2)")
+                }
+            } catch (e: UnsatisfiedLinkError) {
+                appendLog("[ERROR] UnsatisfiedLinkError: ${e.message}")
+                Log.e("FlowService", "UnsatisfiedLinkError", e)
             } catch (e: Exception) {
-                appendLog("[ERROR] JNI: ${e.message}")
+                appendLog("[ERROR] Exception in JNI: ${e.javaClass.name}: ${e.message}")
+                Log.e("FlowService", "JNI exception", e)
+            } catch (e: Error) {
+                appendLog("[ERROR] Error in JNI: ${e.javaClass.name}: ${e.message}")
                 Log.e("FlowService", "JNI error", e)
             } finally {
+                appendLog("[Kotlin] JNI thread finished")
                 isRunning = false
                 onStatusChange?.invoke(false)
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -143,16 +162,19 @@ class FlowService : Service() {
         }
 
         scope.launch {
-            delay(6000)
+            delay(7000)
             if (isRunning) {
-                appendLog("[INFO] ✓ SOCKS5 فعال روی 127.0.0.1:1080")
+                appendLog("[INFO] ✓ SOCKS5 روی 127.0.0.1:1080 فعال")
                 updateNotification("✓ متصل")
             }
         }
     }
 
     private fun stopTunnel() {
-        try { FlowBridge.flowStop() } catch (_: Exception) {}
+        appendLog("[Kotlin] Stopping tunnel...")
+        try { FlowBridge.flowStop() } catch (e: Exception) {
+            appendLog("[WARN] flowStop error: ${e.message}")
+        }
         isRunning = false
         onStatusChange?.invoke(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -160,13 +182,14 @@ class FlowService : Service() {
     }
 
     private fun appendLog(line: String) {
-        val ts = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+        val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.getDefault())
             .format(java.util.Date())
         val entry = "[$ts] $line"
         synchronized(logLines) {
             logLines.add(entry)
             if (logLines.size > 500) logLines.removeAt(0)
         }
+        Log.d("FlowDriver", entry)
         onLogUpdate?.invoke(entry)
     }
 
@@ -194,6 +217,7 @@ class FlowService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        appendLog("[Kotlin] Service destroyed")
         try { FlowBridge.flowStop() } catch (_: Exception) {}
         scope.cancel()
         jniExecutor.shutdown()
