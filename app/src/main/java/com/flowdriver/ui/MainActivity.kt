@@ -1,5 +1,7 @@
 package com.flowdriver.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -24,7 +26,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val prefs by lazy { getSharedPreferences("flowdriver", MODE_PRIVATE) }
 
-    // import credentials.json
     private val pickCredentials = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri ?: return@registerForActivityResult
         importFile(uri, "credentials.json", validate = { content ->
@@ -33,13 +34,12 @@ class MainActivity : AppCompatActivity() {
         }) { toast("✓ credentials.json وارد شد") }
     }
 
-    // import credentials.json.token
     private val pickToken = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         uri ?: return@registerForActivityResult
         importFile(uri, "credentials.json.token", validate = { content ->
             val json = JSONObject(content)
-            if (!json.has("refresh_token")) throw Exception("فایل token معتبر نیست — refresh_token ندارد")
-        }) { toast("✓ credentials.json.token وارد شد") }
+            if (!json.has("refresh_token")) throw Exception("فایل token معتبر نیست")
+        }) { toast("✓ token وارد شد") }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -59,19 +59,33 @@ class MainActivity : AppCompatActivity() {
             binding.tvLog.text = ""
             FlowService.logLines.clear()
         }
+        // دکمه کپی لاگ به clipboard
+        binding.btnCopyLog.setOnClickListener { copyLogToClipboard() }
 
         FlowService.onLogUpdate    = { line -> runOnUiThread { appendLog(line) } }
         FlowService.onStatusChange = { running -> runOnUiThread { syncStatusUI(running) } }
         FlowService.logLines.forEach { appendLog(it) }
     }
 
+    private fun copyLogToClipboard() {
+        val logText = binding.tvLog.text.toString()
+        if (logText.isBlank()) {
+            toast("لاگی برای کپی وجود ندارد")
+            return
+        }
+        val cm = getSystemService(ClipboardManager::class.java)
+        cm.setPrimaryClip(ClipData.newPlainText("FlowDriver Log", logText))
+        toast("✓ لاگ کپی شد — paste کنید")
+    }
+
     private fun toggleTunnel() {
         if (FlowService.isRunning) {
-            startService(Intent(this, FlowService::class.java).apply { action = FlowService.ACTION_STOP })
+            startService(Intent(this, FlowService::class.java).apply {
+                action = FlowService.ACTION_STOP
+            })
             return
         }
 
-        // بررسی هر دو فایل
         val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
 
@@ -110,13 +124,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveSettings() {
         prefs.edit().apply {
-            putString("folder_id",   binding.etFolderId.text.toString().trim())
-            putInt("refresh_ms",     binding.etRefreshRate.text.toString().toIntOrNull() ?: 200)
-            putInt("flush_ms",       binding.etFlushRate.text.toString().toIntOrNull() ?: 300)
-            putString("target_ip",   binding.etTargetIP.text.toString().trim())
-            putString("sni",         binding.etSNI.text.toString().trim())
-            putString("host_header", binding.etHostHeader.text.toString().trim())
-            putBoolean("insecure",   binding.switchInsecure.isChecked)
+            putString("folder_id",    binding.etFolderId.text.toString().trim())
+            putInt("refresh_ms",      binding.etRefreshRate.text.toString().toIntOrNull() ?: 200)
+            putInt("flush_ms",        binding.etFlushRate.text.toString().toIntOrNull() ?: 300)
+            putString("target_ip",    binding.etTargetIP.text.toString().trim())
+            putString("sni",          binding.etSNI.text.toString().trim())
+            putString("host_header",  binding.etHostHeader.text.toString().trim())
+            putBoolean("insecure",    binding.switchInsecure.isChecked)
         }.apply()
     }
 
@@ -152,10 +166,8 @@ class MainActivity : AppCompatActivity() {
     private fun updateBadges() {
         val hasCred  = File(filesDir, "credentials.json").exists()
         val hasToken = File(filesDir, "credentials.json.token").exists()
-
         binding.tvCredStatus.text = if (hasCred) "✓ وارد شده" else "✗ وارد نشده"
         binding.tvCredStatus.setTextColor(getColor(if (hasCred) android.R.color.holo_green_dark else android.R.color.holo_red_dark))
-
         binding.tvTokenStatus.text = if (hasToken) "✓ وارد شده" else "✗ وارد نشده"
         binding.tvTokenStatus.setTextColor(getColor(if (hasToken) android.R.color.holo_green_dark else android.R.color.holo_red_dark))
     }
@@ -167,15 +179,13 @@ class MainActivity : AppCompatActivity() {
         )
         binding.tvStatus.text = if (running) "🟢 متصل" else "🔴 قطع"
         binding.cardSettings.alpha = if (running) 0.5f else 1f
-        binding.btnImportCredentials.isEnabled = !running
-        binding.btnImportToken.isEnabled = !running
     }
 
     private fun appendLog(line: String) {
         binding.tvLog.append("$line\n")
         binding.scrollLog.post { binding.scrollLog.fullScroll(View.FOCUS_DOWN) }
         val lines = binding.tvLog.text.lines()
-        if (lines.size > 200) binding.tvLog.text = lines.takeLast(200).joinToString("\n")
+        if (lines.size > 300) binding.tvLog.text = lines.takeLast(300).joinToString("\n")
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
