@@ -1,14 +1,19 @@
 package com.flowdriver.service
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Environment
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.flowdriver.ui.MainActivity
 import kotlinx.coroutines.*
 import java.io.File
@@ -36,7 +41,7 @@ class FlowService : Service() {
         super.onCreate()
         createNotificationChannel()
         startForeground(NOTIF_ID, buildNotification("آماده..."))
-        appendLog("[Kotlin] Service created")
+        appendLog("[Kotlin] Service created — Android ${Build.VERSION.SDK_INT}")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -49,7 +54,6 @@ class FlowService : Service() {
                 val tokenJson = intent.getStringExtra("token_json") ?: run {
                     appendLog("[ERROR] No token_json"); stopSelf(); return START_NOT_STICKY
                 }
-                appendLog("[Kotlin] Got config and token, starting tunnel...")
                 startTunnel(configJson, tokenJson)
             }
             ACTION_STOP -> stopTunnel()
@@ -58,102 +62,110 @@ class FlowService : Service() {
     }
 
     private fun startTunnel(configJson: String, tokenJson: String) {
-        // ── مرحله ۱: بررسی library ───────────────────────────────────────────
-        appendLog("[Kotlin] Step 1: Loading JNI library...")
+        // ۱. load library
+        appendLog("[Kotlin] Loading JNI library...")
         if (!FlowBridge.load()) {
-            appendLog("[ERROR] Cannot load libflowdriver.so — APK must be built with GitHub Actions")
-            isRunning = false
-            onStatusChange?.invoke(false)
-            stopSelf()
-            return
+            appendLog("[ERROR] Failed to load libflowdriver.so")
+            stopSelf(); return
         }
         appendLog("[Kotlin] Library loaded OK")
 
-        // ── مرحله ۲: نوشتن فایل‌ها ───────────────────────────────────────────
-        appendLog("[Kotlin] Step 2: Writing files...")
+        // ۲. فایل‌ها
         val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
-        val debugLog  = File(filesDir, "fd_debug.log")
 
         if (!credFile.exists()) {
-            appendLog("[ERROR] credentials.json not found in ${filesDir.absolutePath}")
+            appendLog("[ERROR] credentials.json not found")
             stopSelf(); return
         }
-        appendLog("[Kotlin] credFile exists: ${credFile.length()} bytes")
 
         try {
             tokenFile.writeText(tokenJson)
-            appendLog("[Kotlin] tokenFile written: ${tokenFile.length()} bytes")
         } catch (e: Exception) {
-            appendLog("[ERROR] Cannot write token file: ${e.message}")
+            appendLog("[ERROR] Cannot write token: ${e.message}")
             stopSelf(); return
         }
 
-        debugLog.delete()
-        appendLog("[Kotlin] debug log cleared")
+        appendLog("[Kotlin] credFile: ${credFile.absolutePath} (${credFile.length()} bytes)")
+        appendLog("[Kotlin] tokenFile: ${tokenFile.absolutePath} (${tokenFile.length()} bytes)")
 
-        // ── مرحله ۳: شروع tunnel ─────────────────────────────────────────────
+        // بررسی دسترسی Downloads
+        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        appendLog("[Kotlin] Downloads dir: ${downloadsDir.absolutePath}")
+        appendLog("[Kotlin] Downloads writable: ${downloadsDir.canWrite()}")
+
+        // ۳. شروع
         isRunning = true
         onStatusChange?.invoke(true)
         updateNotification("در حال اتصال...")
 
-        // polling فایل لاگ
+        // polling فایل لاگ Go
         scope.launch {
+            val debugLog = File(filesDir, "fd_debug.log")
+            val downloadsLog = File(downloadsDir, "flowdriver_debug.log")
             var lastSize = 0L
+            var shown = mutableSetOf<Int>()
+
             while (isRunning) {
                 delay(400)
                 try {
-                    if (debugLog.exists() && debugLog.length() > lastSize) {
-                        val newContent = debugLog.readText()
-                        val newLines = newContent.lines()
-                        val alreadyShown = if (lastSize == 0L) 0
-                            else newContent.substring(0, lastSize.toInt().coerceAtMost(newContent.length - 1))
-                                .count { it == '\n' }
-                        newLines.drop(alreadyShown).forEach { line ->
-                            if (line.isNotBlank()) appendLog("[Go] $line")
+                    // اول filesDir رو چک کن
+                    val logToRead = when {
+                        debugLog.exists() && debugLog.length() > 0 -> debugLog
+                        downloadsLog.exists() && downloadsLog.length() > 0 -> downloadsLog
+                        else -> null
+                    }
+
+                    logToRead?.let { f ->
+                        val content = f.readText()
+                        val lines = content.lines()
+                        lines.forEachIndexed { idx, line ->
+                            if (line.isNotBlank() && !shown.contains(idx)) {
+                                shown.add(idx)
+                                appendLog("[Go] $line")
+                            }
                         }
-                        lastSize = debugLog.length()
+                        lastSize = f.length()
                     }
                 } catch (_: Exception) {}
             }
-            // بعد از اتمام، بقیه لاگ رو بخون
-            delay(600)
+
+            // بعد از اتمام لاگ نهایی
+            delay(800)
             try {
-                if (debugLog.exists()) {
-                    debugLog.readText().lines().forEach { line ->
-                        if (line.isNotBlank()) appendLog("[Go-final] $line")
+                val f = if (debugLog.exists()) debugLog else downloadsLog
+                if (f.exists()) {
+                    appendLog("=== Final Go Log ===")
+                    f.readText().lines().forEach { line ->
+                        if (line.isNotBlank()) appendLog("[Go] $line")
                     }
                 }
             } catch (_: Exception) {}
         }
 
+        // JNI در thread جداگانه
         jniExecutor.submit {
-            appendLog("[Kotlin] Step 3: Calling JNI startTunnel...")
-            appendLog("[Kotlin] credFile: ${credFile.absolutePath}")
-            appendLog("[Kotlin] tokenFile: ${tokenFile.absolutePath}")
-
+            appendLog("[Kotlin] Calling JNI startTunnel...")
             try {
                 val result = FlowBridge.startTunnel(
                     configJson,
                     credFile.absolutePath,
                     tokenFile.absolutePath
                 )
-                Thread.sleep(800)
+                Thread.sleep(1000)
                 appendLog("[Kotlin] startTunnel returned: $result")
-                if (result == -2) {
-                    appendLog("[ERROR] Login failed (code -2)")
-                }
+                if (result == -2) appendLog("[ERROR] Login failed (code -2)")
+
             } catch (e: UnsatisfiedLinkError) {
                 appendLog("[ERROR] UnsatisfiedLinkError: ${e.message}")
                 Log.e("FlowService", "UnsatisfiedLinkError", e)
             } catch (e: Exception) {
-                appendLog("[ERROR] Exception in JNI: ${e.javaClass.name}: ${e.message}")
+                appendLog("[ERROR] ${e.javaClass.name}: ${e.message}")
                 Log.e("FlowService", "JNI exception", e)
             } catch (e: Error) {
-                appendLog("[ERROR] Error in JNI: ${e.javaClass.name}: ${e.message}")
-                Log.e("FlowService", "JNI error", e)
+                appendLog("[ERROR] ${e.javaClass.name}: ${e.message}")
+                Log.e("FlowService", "JNI error (Error)", e)
             } finally {
-                appendLog("[Kotlin] JNI thread finished")
                 isRunning = false
                 onStatusChange?.invoke(false)
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -164,17 +176,15 @@ class FlowService : Service() {
         scope.launch {
             delay(7000)
             if (isRunning) {
-                appendLog("[INFO] ✓ SOCKS5 روی 127.0.0.1:1080 فعال")
+                appendLog("[INFO] ✓ SOCKS5 فعال روی 127.0.0.1:1080")
                 updateNotification("✓ متصل")
             }
         }
     }
 
     private fun stopTunnel() {
-        appendLog("[Kotlin] Stopping tunnel...")
-        try { FlowBridge.flowStop() } catch (e: Exception) {
-            appendLog("[WARN] flowStop error: ${e.message}")
-        }
+        appendLog("[Kotlin] Stopping...")
+        try { FlowBridge.flowStop() } catch (_: Exception) {}
         isRunning = false
         onStatusChange?.invoke(false)
         stopForeground(STOP_FOREGROUND_REMOVE)

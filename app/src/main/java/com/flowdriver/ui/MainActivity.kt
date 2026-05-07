@@ -1,14 +1,21 @@
 package com.flowdriver.ui
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.flowdriver.databinding.ActivityMainBinding
 import com.flowdriver.model.AppConfig
@@ -38,7 +45,7 @@ class MainActivity : AppCompatActivity() {
         uri ?: return@registerForActivityResult
         importFile(uri, "credentials.json.token", validate = { content ->
             val json = JSONObject(content)
-            if (!json.has("refresh_token")) throw Exception("فایل token معتبر نیست")
+            if (!json.has("refresh_token")) throw Exception("refresh_token ندارد")
         }) { toast("✓ token وارد شد") }
     }
 
@@ -50,6 +57,7 @@ class MainActivity : AppCompatActivity() {
         loadSettings()
         updateBadges()
         syncStatusUI(FlowService.isRunning)
+        requestStoragePermission()
 
         binding.btnImportCredentials.setOnClickListener { pickCredentials.launch("application/json") }
         binding.btnImportToken.setOnClickListener { pickToken.launch("*/*") }
@@ -59,23 +67,37 @@ class MainActivity : AppCompatActivity() {
             binding.tvLog.text = ""
             FlowService.logLines.clear()
         }
-        // دکمه کپی لاگ به clipboard
-        binding.btnCopyLog.setOnClickListener { copyLogToClipboard() }
+        binding.btnCopyLog.setOnClickListener {
+            val text = binding.tvLog.text.toString()
+            if (text.isBlank()) { toast("لاگی وجود ندارد"); return@setOnClickListener }
+            val cm = getSystemService(ClipboardManager::class.java)
+            cm.setPrimaryClip(ClipData.newPlainText("FlowDriver Log", text))
+            toast("✓ لاگ کپی شد")
+        }
 
         FlowService.onLogUpdate    = { line -> runOnUiThread { appendLog(line) } }
         FlowService.onStatusChange = { running -> runOnUiThread { syncStatusUI(running) } }
         FlowService.logLines.forEach { appendLog(it) }
     }
 
-    private fun copyLogToClipboard() {
-        val logText = binding.tvLog.text.toString()
-        if (logText.isBlank()) {
-            toast("لاگی برای کپی وجود ندارد")
-            return
+    private fun requestStoragePermission() {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            // Android 9 و پایین‌تر — نیاز به permission دارن
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                        Manifest.permission.READ_EXTERNAL_STORAGE
+                    ),
+                    100
+                )
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ — نیازی به permission نیست برای Downloads
+            // MediaStore API به جای direct file access
         }
-        val cm = getSystemService(ClipboardManager::class.java)
-        cm.setPrimaryClip(ClipData.newPlainText("FlowDriver Log", logText))
-        toast("✓ لاگ کپی شد — paste کنید")
     }
 
     private fun toggleTunnel() {
@@ -89,22 +111,14 @@ class MainActivity : AppCompatActivity() {
         val credFile  = File(filesDir, "credentials.json")
         val tokenFile = File(filesDir, "credentials.json.token")
 
-        if (!credFile.exists()) {
-            toast("❌ ابتدا credentials.json را import کنید")
-            return
-        }
-        if (!tokenFile.exists()) {
-            toast("❌ ابتدا credentials.json.token را import کنید")
-            return
-        }
+        if (!credFile.exists()) { toast("❌ credentials.json را import کنید"); return }
+        if (!tokenFile.exists()) { toast("❌ credentials.json.token را import کنید"); return }
 
         saveSettings()
-        val tokenJson = tokenFile.readText()
-
         startForegroundService(Intent(this, FlowService::class.java).apply {
             action = FlowService.ACTION_START
             putExtra("config_json", buildConfig().toJson())
-            putExtra("token_json", tokenJson)
+            putExtra("token_json", tokenFile.readText())
         })
     }
 
@@ -148,13 +162,10 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val content = contentResolver.openInputStream(uri)?.bufferedReader()?.readText()
-                    ?: throw Exception("فایل خالی است")
+                    ?: throw Exception("فایل خالی")
                 validate(content)
                 File(filesDir, destName).writeText(content)
-                withContext(Dispatchers.Main) {
-                    updateBadges()
-                    onDone()
-                }
+                withContext(Dispatchers.Main) { updateBadges(); onDone() }
             } catch (e: JSONException) {
                 withContext(Dispatchers.Main) { toast("❌ JSON نامعتبر") }
             } catch (e: Exception) {
@@ -166,9 +177,9 @@ class MainActivity : AppCompatActivity() {
     private fun updateBadges() {
         val hasCred  = File(filesDir, "credentials.json").exists()
         val hasToken = File(filesDir, "credentials.json.token").exists()
-        binding.tvCredStatus.text = if (hasCred) "✓ وارد شده" else "✗ وارد نشده"
+        binding.tvCredStatus.text = if (hasCred) "✓" else "✗"
         binding.tvCredStatus.setTextColor(getColor(if (hasCred) android.R.color.holo_green_dark else android.R.color.holo_red_dark))
-        binding.tvTokenStatus.text = if (hasToken) "✓ وارد شده" else "✗ وارد نشده"
+        binding.tvTokenStatus.text = if (hasToken) "✓" else "✗"
         binding.tvTokenStatus.setTextColor(getColor(if (hasToken) android.R.color.holo_green_dark else android.R.color.holo_red_dark))
     }
 
