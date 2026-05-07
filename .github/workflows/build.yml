@@ -53,9 +53,9 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
+          # FIX: بدون -s -w تا debug info محفوظ بمونه و crash نکنه
           go build \
             -buildmode=c-shared \
-            -ldflags="-s -w" \
             -o libflowdriver.so \
             ./cmd/android
           ls -lh libflowdriver.so
@@ -87,7 +87,6 @@ jobs:
           cp so-artifacts/so-arm64-v8a/libflowdriver.so   app/src/main/jniLibs/arm64-v8a/
           cp so-artifacts/so-armeabi-v7a/libflowdriver.so app/src/main/jniLibs/armeabi-v7a/
           cp so-artifacts/so-x86_64/libflowdriver.so      app/src/main/jniLibs/x86_64/
-          echo "JNI libs:"
           find app/src/main/jniLibs -name "*.so" | xargs ls -lh
 
       - uses: actions/setup-java@v4
