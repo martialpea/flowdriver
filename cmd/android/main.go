@@ -2,7 +2,6 @@ package main
 
 /*
 #include <stdlib.h>
-#include <stdio.h>
 */
 import "C"
 
@@ -38,6 +37,9 @@ var (
 )
 
 func lg(format string, args ...interface{}) {
+	if len(logFiles) == 0 {
+		return
+	}
 	msg := fmt.Sprintf(format, args...)
 	ts := time.Now().Format("15:04:05.000")
 	line := ts + " " + msg + "\n"
@@ -47,10 +49,6 @@ func lg(format string, args ...interface{}) {
 			f.Sync()
 		}
 	}
-	// همچنین با C printf بنویس که به logcat میره
-	cmsg := C.CString(line)
-	C.printf(cmsg)
-	C.free(cmsg)
 }
 
 func openLog(filesDir string) {
@@ -89,8 +87,6 @@ func (rawResolver) Resolve(ctx context.Context, name string) (context.Context, n
 	return ctx, nil, nil
 }
 
-// تست ساده — فقط عدد برگردون
-//
 //export Java_com_flowdriver_service_FlowBridge_ping
 func Java_com_flowdriver_service_FlowBridge_ping(env uintptr, obj uintptr) int32 {
 	return 42
@@ -212,7 +208,7 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 		return fmt.Errorf("refresh_token empty")
 	}
 
-	lg("OAuth request to %s", tokenURI)
+	lg("OAuth to %s", tokenURI)
 	plainClient := &http.Client{Timeout: 30 * time.Second}
 
 	v := url.Values{}
@@ -319,8 +315,12 @@ func runClient(ctx context.Context, configJson, credFilePath, tokenFilePath stri
 }
 
 func safe(s string, n int) string {
-	if s == "" { return "(empty)" }
-	if len(s) <= n { return s }
+	if s == "" {
+		return "(empty)"
+	}
+	if len(s) <= n {
+		return s
+	}
 	return s[:n] + "..."
 }
 
