@@ -145,7 +145,9 @@ class FlowService : Service() {
 
         // JNI در thread جداگانه
         jniExecutor.submit {
-            appendLog("[Kotlin] Calling JNI startTunnel...")
+            val pingResult = try { FlowBridge.ping() } catch (e: Exception) { -999 }
+                appendLog("[Kotlin] ping test: $pingResult (expected 42)")
+                appendLog("[Kotlin] Calling JNI startTunnel...")
             try {
                 val result = FlowBridge.startTunnel(
                     configJson,

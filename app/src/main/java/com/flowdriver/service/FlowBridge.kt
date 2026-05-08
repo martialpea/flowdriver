@@ -15,7 +15,8 @@ object FlowBridge {
         }
     }
 
-    // FIX: فقط int برمی‌گردونه — بدون هیچ String/C.CString
+    // تست ساده — فقط 42 برمی‌گردونه
+    external fun ping(): Int
     external fun startTunnel(configJson: String, credFilePath: String, tokenFilePath: String): Int
     external fun flowStop()
     external fun flowIsRunning(): Int
